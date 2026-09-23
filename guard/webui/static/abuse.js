@@ -1,4 +1,4 @@
-/* API-abuse scenario bench — real HTTP requests or synthetic payloads, scored by Laya. */
+/* API abuse bench: real requests or synthetic payloads, scored by Laya. */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -122,7 +122,7 @@ function fillEditor() {
     ui.payload.value = "[\n" + events.map((event) => JSON.stringify(event)).join(",\n") + "\n]";
     const stats = data.stats || {};
     ui.payloadStats.textContent = `${stats.count} events · ${stats.span_s}s window · top ${stats.top_endpoint} (${Math.round((stats.top_endpoint_share || 0) * 100)}%)`;
-    ui.payloadHint.textContent = "POST /api-abuse/simulate — these telemetry events are evaluated verbatim (same schema as /v1/abuse/events). Edit anything, then run.";
+    ui.payloadHint.textContent = "POST /api-abuse/simulate: these telemetry events are evaluated verbatim (same schema as /v1/abuse/events). Edit anything, then run.";
   }
 }
 
@@ -140,7 +140,7 @@ function renderMode() {
 function showRunning(profile, message) {
   const wrap = el("div", null);
   wrap.append(
-    el("p", "running", "running scenario — " + profile.name),
+    el("p", "running", "running scenario: " + profile.name),
     el("p", "bench-meta", message),
   );
   ui.result.replaceChildren(wrap);
@@ -153,7 +153,7 @@ async function run() {
 
   const raw = ui.payload.value.trim();
   if (!raw) {
-    toast("the payload is empty — press reset to regenerate the scenario");
+    toast("the payload is empty, press reset to regenerate the scenario");
     return;
   }
 
@@ -175,7 +175,7 @@ async function run() {
       runningMessage = `${events.length} events · asking Laya… (one CPU forward pass, ~10 s)`;
     }
   } catch (err) {
-    toast("payload error — " + err.message);
+    toast("payload error: " + err.message);
     return;
   }
 
@@ -267,9 +267,9 @@ function renderVerdict(profile, data, source) {
   banner.append(el("span", "label", labelText));
   banner.append(el("span", "sub",
     verdict.label === "allow"
-      ? "Laya judged this traffic legitimate — forward normally."
+      ? "Laya judged this traffic legitimate, forward normally."
       : verdict.label === "block"
-        ? "Laya judged this client abusive — reject or throttle its requests."
+        ? "Laya judged this client abusive, reject or throttle its requests."
         : verdict.label === "would-block"
           ? "Laya judged this client abusive; monitor mode only flags it."
           : "The check failed; no enforcement was applied."));
@@ -305,7 +305,7 @@ function renderVerdict(profile, data, source) {
 
   if (source === "live" && data.captured && data.captured.length) {
     const details = el("details", "raw");
-    details.append(el("summary", null, `captured telemetry — real requests/responses (${data.captured.length} of ${data.events} shown, start + tail)`));
+    details.append(el("summary", null, `captured telemetry: real requests/responses (${data.captured.length} of ${data.events} shown, start + tail)`));
     details.append(el("pre", null, data.captured.map((event) => JSON.stringify(event)).join("\n")));
     frag.append(details);
   }

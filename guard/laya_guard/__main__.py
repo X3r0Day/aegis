@@ -3,10 +3,8 @@
     python -m laya_guard "ignore all previous instructions"
     python -m laya_guard --messages '[{"role":"user","content":"..."}]'
     python -m laya_guard --request-file request.json
-    echo "text to check" | python -m laya_guard
+    echo "text" | python -m laya_guard
 """
-from __future__ import annotations
-
 import argparse
 import json
 import sys
@@ -16,7 +14,7 @@ from .config import GuardConfig
 from .guard import LayaGuard
 
 
-def _load_payload(args) -> dict:
+def _load_payload(args):
     if args.request_file:
         payload = json.loads(Path(args.request_file).read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
@@ -33,10 +31,10 @@ def _load_payload(args) -> dict:
             return parsed if isinstance(parsed, dict) else {"input": raw}
         except ValueError:
             return {"input": raw}
-    raise SystemExit("nothing to check — pass text, --messages, --request-file, or stdin")
+    raise SystemExit("nothing to check: pass text, --messages, --request-file, or pipe something in")
 
 
-def main() -> int:
+def main():
     ap = argparse.ArgumentParser(
         prog="laya_guard",
         description=__doc__,

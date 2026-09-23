@@ -75,7 +75,7 @@ TRIAGE_QUESTIONS = {
 # -------------------------------------------------------------------- email
 EMAIL = {
     "from": "no-reply@example-login.com",
-    "subject": "URGENT: Your account will be suspended — verify now",
+    "subject": "URGENT: Your account will be suspended, verify now",
     "body": (
         "Dear customer,\n\n"
         "We detected unusual activity on your account. You must verify your identity "

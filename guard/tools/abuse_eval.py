@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""Calibration bench for the abuse detector.
-
-Renders the six synthetic profiles as prose stories and asks each checkpoint
-two question schemas (the abuse taxonomy and the security-incident schema the
-typed-decisions checkpoint was fine-tuned on). Use it to pick checkpoint,
-schema and report style before wiring enforcement.
+"""Abuse bench: profiles rendered as prose, several checkpoints and question
+schemas side by side. Settled on typed-decisions and the merged schema with
+this; rerun it when trying something new.
 
     .venv/bin/python guard/tools/abuse_eval.py
     .venv/bin/python guard/tools/abuse_eval.py --models english typed-decisions
 """
-from __future__ import annotations
-
 import argparse
 import os
 import sys

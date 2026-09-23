@@ -1,37 +1,29 @@
 #!/usr/bin/env python3
-"""Laya Guard — a prompt-injection firewall in front of DeepSeek, with a chat UI.
-
-The middleware owns the upstream key and drops requests the guard classifies
-as prompt injection before they ever reach the model. The bundled chat page is
-just another client of the same OpenAI-compatible endpoint.
+"""Guard server: prompt-injection firewall + API abuse detector + chat UI.
 
     export DEEPSEEK_API_KEY=sk-...
-    .venv/bin/python guard/app.py          # http://127.0.0.1:8978
+    .venv/bin/python guard/app.py            # http://127.0.0.1:8978
 
-Environment:
-    GUARD_MODE           block | monitor                  (default block)
-    GUARD_THRESHOLD      decision threshold               (default 0.8)
-    GUARD_MODEL          auto | english | multilingual    (default auto)
-    GUARD_LOG            decision log path                (default guard/logs/decisions.jsonl)
-    GUARD_EXCERPT_CHARS  input chars to store in the log  (default 0 = none)
-    UPSTREAM_BASE        default https://api.deepseek.com
-    UPSTREAM_MODEL       default deepseek-chat
-    UPSTREAM_KEY_ENV     env var holding the key          (default DEEPSEEK_API_KEY)
+env:
+    GUARD_MODE=block|monitor        guard threshold, decision policy
+    GUARD_THRESHOLD=0.8
+    GUARD_MODEL=english
+    GUARD_FASTPATH=0|1              distilled student pre-filter
+    ABUSE_MODE, ABUSE_THRESHOLD, ABUSE_MODEL, ABUSE_COOLDOWN
+    ABUSE_ENFORCE, ABUSE_BLOCK_TTL, ABUSE_ENFORCE_INTERVAL
+    DEMO_RATE_LIMIT=60              rule limiter on /demo-api, 0 to disable
+    UPSTREAM_BASE, UPSTREAM_MODEL, UPSTREAM_KEY_ENV
 """
-from __future__ import annotations
-
 import asyncio
 import copy
 import hashlib
 import json
 import os
 import random
-import sys
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 import httpx
 import uvicorn
@@ -40,12 +32,11 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Resp
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-HERE = Path(__file__).resolve().parent          # binary/guard
-ROOT = HERE.parent                              # binary/
-# laya_guard/ and tools/ both live next to this file — no path juggling needed
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 
 os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("HF_HOME", str(ROOT / "laya" / "models" / "hf"))
+os.environ.setdefault("HF_HOME", str(ROOT / "laya/models/hf"))
 
 from laya_guard import (  # noqa: E402
     AbuseConfig,
@@ -59,79 +50,66 @@ from laya_guard import (  # noqa: E402
     model_registry,
     rule_decision,
 )
+from tools import abuse_demo  # noqa: E402
 
-from tools import abuse_demo  # noqa: E402  — synthetic traffic profiles for the scenario bench
 
-# --------------------------------------------------------------------- config
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
 MODE = _env("GUARD_MODE", "block")
 THRESHOLD = float(_env("GUARD_THRESHOLD", "0.8"))
-GUARD_MODEL = _env("GUARD_MODEL", "english")             # English only for now
+GUARD_MODEL = _env("GUARD_MODEL", "english")
 UPSTREAM_BASE = _env("UPSTREAM_BASE", "https://api.deepseek.com").rstrip("/")
 UPSTREAM_MODEL = _env("UPSTREAM_MODEL", "deepseek-chat")
 UPSTREAM_KEY_ENV = _env("UPSTREAM_KEY_ENV", "DEEPSEEK_API_KEY")
-LOG_PATH = Path(_env("GUARD_LOG", str(HERE / "logs" / "decisions.jsonl")))
+LOG_PATH = Path(_env("GUARD_LOG", str(HERE / "logs/decisions.jsonl")))
 EXCERPT_CHARS = int(_env("GUARD_EXCERPT_CHARS", "0"))
 
 ABUSE_MODE = _env("ABUSE_MODE", "monitor")
 ABUSE_THRESHOLD = float(_env("ABUSE_THRESHOLD", "0.45"))
 ABUSE_COOLDOWN = float(_env("ABUSE_COOLDOWN", "60"))
 ABUSE_MODEL = _env("ABUSE_MODEL", "typed-decisions")
-ABUSE_LOG = Path(_env("ABUSE_LOG", str(HERE / "logs" / "abuse.jsonl")))
+ABUSE_LOG = Path(_env("ABUSE_LOG", str(HERE / "logs/abuse.jsonl")))
 ABUSE_ENFORCE = _env("ABUSE_ENFORCE", "1").lower() not in ("0", "false", "no")
 ABUSE_BLOCK_TTL = float(_env("ABUSE_BLOCK_TTL", "60"))
 ABUSE_ENFORCE_INTERVAL = float(_env("ABUSE_ENFORCE_INTERVAL", "5"))
 GUARD_FASTPATH = _env("GUARD_FASTPATH", "0").lower() not in ("0", "false", "no")
 GUARD_FASTPATH_THRESHOLD = float(_env("GUARD_FASTPATH_THRESHOLD", "0.9"))
 
-CHAT_HTML = HERE / "webui" / "chat.html"
-ABUSE_HTML = HERE / "webui" / "abuse.html"
-STATIC_DIR = HERE / "webui" / "static"
+CHAT_HTML = HERE / "webui/chat.html"
+ABUSE_HTML = HERE / "webui/abuse.html"
+STATIC_DIR = HERE / "webui/static"
 
-guard = LayaGuard(
-    GuardConfig(
-        model=GUARD_MODEL,
-        threshold=THRESHOLD,
-        mode=MODE,
-        excerpt_chars=EXCERPT_CHARS,
-    )
-)
+guard = LayaGuard(GuardConfig(model=GUARD_MODEL, threshold=THRESHOLD,
+                              mode=MODE, excerpt_chars=EXCERPT_CHARS))
 log = DecisionLog(LOG_PATH)
 
-abuse = AbuseDetector(
-    AbuseConfig(
-        model=ABUSE_MODEL,
-        threshold=ABUSE_THRESHOLD,
-        mode=ABUSE_MODE,
-        cooldown_s=ABUSE_COOLDOWN,
-    )
-)
+abuse = AbuseDetector(AbuseConfig(model=ABUSE_MODEL, threshold=ABUSE_THRESHOLD,
+                                  mode=ABUSE_MODE, cooldown_s=ABUSE_COOLDOWN))
 abuse_log = DecisionLog(ABUSE_LOG)
 
-_fast_guard: Optional[FastGuard] = None
+_fast_guard = None
 _fast_guard_lock = threading.Lock()
 
 
-def get_fast_guard() -> Optional[FastGuard]:
-    """The distilled sub-millisecond student, when enabled and trained."""
+def get_fast_guard():
     global _fast_guard
     if not GUARD_FASTPATH or not FastGuard.available():
         return None
     with _fast_guard_lock:
         if _fast_guard is None:
             _fast_guard = FastGuard(threshold=GUARD_FASTPATH_THRESHOLD)
-            print("[guard] fast path loaded (threshold %.2f)" % GUARD_FASTPATH_THRESHOLD, flush=True)
+            print("[guard] fast path loaded, threshold %.2f" % GUARD_FASTPATH_THRESHOLD, flush=True)
     return _fast_guard
 
 
-def upstream_key() -> str:
+def upstream_key():
     return os.environ.get(UPSTREAM_KEY_ENV, "")
 
 
-def _compact_verdict(verdict) -> str:
+def _compact_verdict(verdict):
+    # small enough to ride in a response header
     compact = {
         "label": verdict.label,
         "decision": verdict.decision,
@@ -145,28 +123,25 @@ def _compact_verdict(verdict) -> str:
     return json.dumps(compact, separators=(",", ":"), ensure_ascii=True)
 
 
-def _warm_all() -> None:
+def _warm_all():
     guard.warm()
     abuse.warm()
     try:
         get_fast_guard()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print("[guard] fast path unavailable: %r" % exc, flush=True)
 
 
-async def _enforcement_loop() -> None:
-    """Every few seconds: evaluate triggered clients and block the abusive ones.
-
-    This is the overseer acting on Laya's verdict — until this existed, the
-    detector only observed. Blocks expire after ABUSE_BLOCK_TTL seconds.
-    """
+async def _enforcement_loop():
+    # every few seconds: evaluate triggered clients and block the abusive ones
+    # for ABUSE_BLOCK_TTL. the detector itself only observes
     while True:
         await asyncio.sleep(ABUSE_ENFORCE_INTERVAL)
         if not ABUSE_ENFORCE:
             continue
         try:
             verdicts = await run_in_threadpool(abuse.evaluate_triggered, "block")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print("[guard] enforcement loop error: %r" % exc, flush=True)
             continue
         for verdict in verdicts:
@@ -174,7 +149,7 @@ async def _enforcement_loop() -> None:
             if verdict.enforced:
                 abuse.block_client(verdict.client, ABUSE_BLOCK_TTL,
                                    category=verdict.category, score=verdict.abuse_score)
-                print("[guard] blocked %s for %.0fs — %s (score %.3f)"
+                print("[guard] blocked %s for %.0fs, %s (%.3f)"
                       % (verdict.client, ABUSE_BLOCK_TTL, verdict.category, verdict.abuse_score), flush=True)
 
 
@@ -191,7 +166,6 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Laya Guard", version="0.1.0", lifespan=lifespan)
 
 
-# ---------------------------------------------------------------------- pages
 @app.get("/")
 def index():
     return RedirectResponse(url="/chat", status_code=307)
@@ -210,9 +184,17 @@ def abuse_page():
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-# ----------------------------------------------------------------------- api
+def _cuda():
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
 @app.get("/health")
-def health() -> Dict[str, Any]:
+def health():
     return {
         "status": "ok",
         "key_env": UPSTREAM_KEY_ENV,
@@ -247,7 +229,6 @@ def health() -> Dict[str, Any]:
 
 @app.get("/api/models")
 def api_models():
-    """The Laya checkpoints this deployment knows about (runnable or not)."""
     return {
         "models": [entry.to_dict() for entry in model_registry()],
         "guard_default": GUARD_MODEL,
@@ -255,23 +236,18 @@ def api_models():
     }
 
 
-def _cuda() -> bool:
-    try:
-        import torch
-
-        return torch.cuda.is_available()
-    except Exception:
-        return False
-
-
 @app.get("/api/decisions")
 def decisions(limit: int = 60):
     return {"decisions": log.tail(limit)}
 
 
+def _request_mode(request):
+    header = (request.headers.get("x-guard-mode") or "").lower()
+    return header if header in ("block", "monitor") else MODE
+
+
 @app.post("/v1/guard/check")
 async def guard_check(request: Request):
-    """Evaluate a request without forwarding it (used by tooling and demos)."""
     try:
         payload = await request.json()
     except Exception:
@@ -283,39 +259,32 @@ async def guard_check(request: Request):
     return verdict.to_dict()
 
 
-def _request_mode(request: Request) -> str:
-    header = (request.headers.get("x-guard-mode") or "").lower()
-    return header if header in ("block", "monitor") else MODE
-
-
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
         payload = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": {"message": "request body must be JSON"}})
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be json"}})
 
     messages = payload.get("messages") if isinstance(payload, dict) else None
     if not isinstance(messages, list) or not messages:
         return JSONResponse(
             status_code=422,
-            content={"error": {"message": "'messages' must be a non-empty list", "type": "invalid_request_error"}},
+            content={"error": {"message": "messages must be a non-empty list", "type": "invalid_request_error"}},
         )
 
     mode = _request_mode(request)
 
+    # cheap student first, but only for confident blocks, and never against a
+    # rule-allow (greetings for example)
     fast = get_fast_guard()
     if fast is not None and mode == "block":
         text, scope = extract_scan_text(messages, guard.cfg.scope)
         fast_result = fast.score(text)
-        # a rule-allow (e.g. a greeting) must not be overridden by the student
         rule = rule_decision(text) or ""
         if fast_result.probability >= GUARD_FASTPATH_THRESHOLD and not rule.startswith("allow"):
             fast_verdict = Verdict(
-                decision="block",
-                blocked=True,
-                enforced=True,
-                mode=mode,
+                decision="block", blocked=True, enforced=True, mode=mode,
                 threshold=GUARD_FASTPATH_THRESHOLD,
                 thresholds={"fastpath": GUARD_FASTPATH_THRESHOLD},
                 probabilities={"fastpath_block": fast_result.probability},
@@ -334,7 +303,7 @@ async def chat_completions(request: Request):
             return JSONResponse(
                 status_code=403,
                 content={
-                    "error": {"message": "Blocked by Laya Guard (fast path): prompt injection",
+                    "error": {"message": "blocked by Laya Guard (fast path): prompt injection",
                               "type": "prompt_injection_blocked", "code": "guard_blocked"},
                     "guard": fast_verdict.to_dict(),
                 },
@@ -349,7 +318,7 @@ async def chat_completions(request: Request):
             status_code=403,
             content={
                 "error": {
-                    "message": "Blocked by Laya Guard: prompt injection",
+                    "message": "blocked by Laya Guard: prompt injection",
                     "type": "prompt_injection_blocked",
                     "code": "guard_blocked",
                 },
@@ -363,10 +332,8 @@ async def chat_completions(request: Request):
         return JSONResponse(
             status_code=502,
             content={
-                "error": {
-                    "message": "%s is not set on the guard server" % UPSTREAM_KEY_ENV,
-                    "type": "upstream_key_missing",
-                },
+                "error": {"message": "%s not set on the guard server" % UPSTREAM_KEY_ENV,
+                          "type": "upstream_key_missing"},
                 "guard": verdict.to_dict(),
             },
             headers={"X-Guard-Verdict": _compact_verdict(verdict)},
@@ -387,44 +354,39 @@ async def chat_completions(request: Request):
     except httpx.HTTPError as exc:
         return JSONResponse(
             status_code=502,
-            content={
-                "error": {"message": "upstream request failed: %s" % exc, "type": "upstream_error"},
-                "guard": verdict.to_dict(),
-            },
+            content={"error": {"message": "upstream failed: %s" % exc, "type": "upstream_error"},
+                     "guard": verdict.to_dict()},
             headers={"X-Guard-Verdict": _compact_verdict(verdict)},
         )
 
-    headers = {
-        "X-Guard-Verdict": _compact_verdict(verdict),
-        "X-Upstream-Ms": "%.0f" % ((time.perf_counter() - started) * 1000.0),
-    }
     return Response(
         content=upstream.content,
         status_code=upstream.status_code,
         media_type=upstream.headers.get("content-type", "application/json"),
-        headers=headers,
+        headers={
+            "X-Guard-Verdict": _compact_verdict(verdict),
+            "X-Upstream-Ms": "%.0f" % ((time.perf_counter() - started) * 1000.0),
+        },
     )
 
 
-# ---------------------------------------------------------------------- abuse
-def _abuse_mode(request: Request) -> str:
+def _abuse_mode(request):
     header = (request.headers.get("x-abuse-mode") or "").lower()
     return header if header in ("block", "monitor") else ABUSE_MODE
 
 
-def _events_from_body(body: Any) -> list:
+def _events_from_body(body):
     if isinstance(body, list):
         return body
     if isinstance(body, dict):
         for key in ("events", "requests", "logs"):
             if isinstance(body.get(key), list):
                 return body[key]
-    raise ValueError("body must be a JSON list of events or an object with an 'events' list")
+    raise ValueError("body must be a list of events, or an object with an events list")
 
 
 @app.post("/v1/abuse/events")
 async def abuse_events(request: Request):
-    """Ingest request telemetry; triggered clients are evaluated (cooldown-gated)."""
     try:
         payload = await request.json()
         events = _events_from_body(payload)
@@ -435,7 +397,7 @@ async def abuse_events(request: Request):
     try:
         await run_in_threadpool(abuse.observe, events)
     except (ValueError, TypeError) as exc:
-        return JSONResponse(status_code=422, content={"error": {"message": "invalid event: %s" % exc, "type": "invalid_request_error"}})
+        return JSONResponse(status_code=422, content={"error": {"message": "bad event: %s" % exc, "type": "invalid_request_error"}})
 
     mode = _abuse_mode(request)
     verdicts = await run_in_threadpool(abuse.evaluate_triggered, mode)
@@ -451,11 +413,10 @@ def abuse_clients(top: int = 20):
 
 @app.post("/v1/abuse/check")
 async def abuse_check(request: Request):
-    """Evaluate supplied events (request-file path) or one live client."""
     try:
         payload = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be json"}})
 
     mode = _abuse_mode(request)
     if isinstance(payload, dict) and payload.get("client"):
@@ -465,7 +426,7 @@ async def abuse_check(request: Request):
         except KeyError as exc:
             return JSONResponse(status_code=404, content={"error": {"message": str(exc)}})
         if verdict is None:
-            return JSONResponse(status_code=404, content={"error": {"message": "client %r has no traffic" % key}})
+            return JSONResponse(status_code=404, content={"error": {"message": "no traffic for client %r" % key}})
         abuse_log.append(verdict, meta={"endpoint": "abuse/check", "client": key})
         return {"verdicts": [verdict.to_dict()]}
 
@@ -484,25 +445,21 @@ def abuse_decisions(limit: int = 60):
     return {"decisions": abuse_log.tail(limit)}
 
 
-# ------------------------------------------------------------------ demo API
-# A small but real HTTP API the bench sends actual requests to. It stands in
-# for the customer's API behind the guard: every request is recorded as
-# telemetry, and clients Laya has flagged are rejected with 429 while blocked.
-_DEMO_RATE: Dict[str, list] = {}
-_DEMO_INFLIGHT: Dict[str, int] = {}
-# Rule-based protection of the demo API itself (separate from Laya blocks).
-# 0 disables it, so the only thing stopping a flood is Laya's verdict.
-_DEMO_RATE_LIMIT = float(_env("DEMO_RATE_LIMIT", "60"))
+# the bench hits this with real requests. it plays the customer API behind the
+# guard: every request becomes telemetry, blocked clients get 429 until TTL ends
+_DEMO_RATE = {}
+_DEMO_INFLIGHT = {}
+_DEMO_RATE_LIMIT = float(_env("DEMO_RATE_LIMIT", "60"))  # 0 = off, Laya only
 
 
-def _demo_client(request: Request) -> str:
+def _demo_client(request):
     forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     if forwarded:
         return forwarded
     return request.client.host if request.client else "?"
 
 
-def _demo_rate_limited(client: str) -> bool:
+def _demo_rate_limited(client):
     if _DEMO_RATE_LIMIT <= 0:
         return False
     now = time.time()
@@ -514,7 +471,7 @@ def _demo_rate_limited(client: str) -> bool:
     return bucket[1] > _DEMO_RATE_LIMIT
 
 
-def _demo_decr_inflight(client: str) -> None:
+def _demo_decr_inflight(client):
     _DEMO_INFLIGHT[client] = max(0, _DEMO_INFLIGHT.get(client, 1) - 1)
 
 
@@ -530,7 +487,7 @@ async def demo_api_middleware(request: Request, call_next):
     inflight = _DEMO_INFLIGHT.get(client, 0) + 1
     _DEMO_INFLIGHT[client] = inflight
 
-    def record(status: int, size: int) -> None:
+    def record(status, size):
         try:
             abuse.observe([{
                 "ts": started,
@@ -552,7 +509,7 @@ async def demo_api_middleware(request: Request, call_next):
             record(429, 0)
             _demo_decr_inflight(client)
             return JSONResponse(status_code=429, content={
-                "detail": "blocked by Laya Guard — %s (retry in %ss)"
+                "detail": "blocked by Laya Guard: %s (retry in %ss)"
                           % (block.get("category") or "abuse", int(block["remaining_s"])),
                 "guard": {"client": client, **block},
             })
@@ -568,8 +525,7 @@ async def demo_api_middleware(request: Request, call_next):
         record(500, 0)
         _demo_decr_inflight(client)
         raise
-    size = int(response.headers.get("content-length") or 0)
-    record(response.status_code, size)
+    record(response.status_code, int(response.headers.get("content-length") or 0))
     _demo_decr_inflight(client)
     return response
 
@@ -578,17 +534,17 @@ async def demo_api_middleware(request: Request, call_next):
 @app.get("/demo-api/")
 def demo_index():
     return {
-        "service": "demo API — the stand-in for the customer's API behind Laya Guard",
+        "service": "demo API, the stand-in for the customer API behind Laya Guard",
         "endpoints": [
             "GET  /demo-api/v1/products",
-            "GET  /demo-api/v1/products/{id}   (1–500)",
+            "GET  /demo-api/v1/products/{id}   (1-500)",
             "GET  /demo-api/v1/orders",
-            "GET  /demo-api/v1/orders/{id}     (1–2000)",
+            "GET  /demo-api/v1/orders/{id}     (1-2000)",
             "GET  /demo-api/v1/me",
             "GET  /demo-api/v1/cart",
             "GET  /demo-api/v1/search?q=",
             "GET  /demo-api/v1/jobs/status",
-            "GET  /demo-api/v1/users/{id}      (1–4900)",
+            "GET  /demo-api/v1/users/{id}      (1-4900)",
             "POST /demo-api/v1/auth/login      (username ending 00 + password 'correct')",
         ],
         "notes": "every request is recorded as telemetry; Laya Guard blocks abusive clients with 429",
@@ -653,16 +609,14 @@ async def demo_login(request: Request):
     except Exception:
         body = {}
     username = str(body.get("username") or "")
-    password = str(body.get("password") or "")
-    if username.endswith("00") and password == "correct":
+    if username.endswith("00") and str(body.get("password") or "") == "correct":
         return {"token": "demo-token", "user": username}
     raise HTTPException(status_code=401, detail="invalid credentials")
 
 
-# ------------------------------------------------------------- live scenarios
-def _base_plan(**overrides: Any) -> Dict[str, Any]:
-    plan: Dict[str, Any] = {
-        "target": "",  # filled with this server's /demo-api at request time
+def _base_plan(**overrides):
+    plan = {
+        "target": "",              # request.base_url + /demo-api, filled in below
         "method": "GET",
         "pick": "cycle",
         "paths": ["/v1/me"],
@@ -677,7 +631,7 @@ def _base_plan(**overrides: Any) -> Dict[str, Any]:
     return plan
 
 
-LIVE_PLANS: Dict[str, Dict[str, Any]] = {
+LIVE_PLANS = {
     "normal_browse": _base_plan(
         client_ip="198.51.100.10",
         user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
@@ -697,7 +651,7 @@ LIVE_PLANS: Dict[str, Dict[str, Any]] = {
         client_ip="203.0.113.9",
         user_agent="python-requests/2.32.3",
         asn="24940", country="DE", datacenter=True,
-        # long enough that the enforcement loop cuts it off mid-run
+        # long enough for the enforcement loop to cut it off mid-run
         paths=["/v1/users/{id}"], count=300, rate_per_s=15, id_start=4800, id_step=1, concurrency=8,
     ),
     "credential_stuffing": _base_plan(
@@ -724,18 +678,18 @@ LIVE_PLANS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _plan_for(profile_id: str, request: Request) -> Dict[str, Any]:
+def _plan_for(profile_id, request):
     plan = copy.deepcopy(LIVE_PLANS[profile_id])
     if not plan.get("target"):
         plan["target"] = str(request.base_url).rstrip("/") + "/demo-api"
     return plan
 
 
-async def _execute_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """Send the plan's HTTP requests for real and capture their telemetry."""
+async def _execute_plan(plan):
+    # real requests, real statuses, paced by rate_per_s with optional jitter
     target = str(plan.get("target") or "").rstrip("/")
     if not target.startswith(("http://", "https://")):
-        raise ValueError("target must be an http(s) URL")
+        raise ValueError("target must be an http(s) url")
     count = max(1, min(int(plan.get("count") or 1), 2000))
     rate = max(0.1, min(float(plan.get("rate_per_s") or 1), 500.0))
     concurrency = max(1, min(int(plan.get("concurrency") or 8), 64))
@@ -759,20 +713,17 @@ async def _execute_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     headers = {"User-Agent": user_agent, "X-Forwarded-For": client_ip, **extra_headers}
     rng = random.Random(7)
     semaphore = asyncio.Semaphore(concurrency)
-    events: List[Dict[str, Any]] = []
-    statuses: Dict[str, int] = {}
+    events = []
+    statuses = {}
     errors = 0
 
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
-        async def fire(index: int, path: str) -> None:
+        async def fire(index, path):
             nonlocal errors
             async with semaphore:
                 started = time.time()
-                body = None
-                if auth:
-                    body = {"username": "user%04d" % index, "password": "guess-%d" % index}
-                status, size = 0, 0
-                guard_blocked = False
+                body = {"username": "user%04d" % index, "password": "guess-%d" % index} if auth else None
+                status, size, guard_blocked = 0, 0, False
                 try:
                     response = await client.request(method, target + path, headers=headers, json=body)
                     status = response.status_code
@@ -781,16 +732,15 @@ async def _execute_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
                         guard_blocked = True
                 except httpx.HTTPError:
                     errors += 1
-                latency = (time.time() - started) * 1000.0
                 if status:
                     key = "429_laya" if guard_blocked else str(status)
                     statuses[key] = statuses.get(key, 0) + 1
-                event: Dict[str, Any] = {
+                event = {
                     "ts": started,
                     "method": method,
                     "path": path,
                     "status": status,
-                    "latency_ms": round(latency, 2),
+                    "latency_ms": round((time.time() - started) * 1000, 2),
                     "bytes_out": size,
                     "ip": client_ip,
                     "user_agent": user_agent,
@@ -819,7 +769,6 @@ async def _execute_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
     return {"events": events, "duration_s": round(duration, 2), "statuses": statuses, "errors": errors}
 
 
-# --------------------------------------------------------------- scenario bench
 ABUSE_PROFILES = [
     {
         "id": "normal_browse",
@@ -831,7 +780,7 @@ ABUSE_PROFILES = [
         "id": "integration_poll",
         "name": "Legit integration poller",
         "expect": "allow",
-        "description": "A known keyed client polls one endpoint steadily — automated but legitimate.",
+        "description": "A known keyed client polls one endpoint steadily, automated but legitimate.",
     },
     {
         "id": "scraper",
@@ -865,14 +814,14 @@ def api_abuse_profiles():
     return {"profiles": ABUSE_PROFILES, "default_mode": "block", "model": ABUSE_MODEL}
 
 
-def _capture_sample(events: list, head: int = 50, tail: int = 70) -> list:
-    """A readable slice of a run: the early behaviour plus how it ended."""
+def _capture_sample(events, head=50, tail=70):
+    # start of the run plus how it ended, so a mid-run block is visible
     if len(events) <= head + tail:
         return events
     return events[:head] + events[-tail:]
 
 
-def _event_stats(events: list) -> Dict[str, Any]:
+def _event_stats(events):
     if not events:
         return {"count": 0}
     clients, endpoints, stamps = {}, {}, []
@@ -896,19 +845,16 @@ def _event_stats(events: list) -> Dict[str, Any]:
     }
 
 
-def _generate_profile(profile_id: str, seed: int) -> list:
-    rng = random.Random(seed)
-    now = time.time()
-    return abuse_demo.PROFILES[profile_id](now, rng)
+def _generate_profile(profile_id, seed):
+    return abuse_demo.PROFILES[profile_id](time.time(), random.Random(seed))
 
 
 @app.post("/api-abuse/preview")
 async def api_abuse_preview(request: Request):
-    """Return the exact telemetry payload a scenario would send (editable in the UI)."""
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be json"}})
     profile_id = body.get("profile")
     if profile_id not in abuse_demo.PROFILES:
         return JSONResponse(status_code=422, content={"error": {"message": "unknown profile %r" % profile_id}})
@@ -925,16 +871,11 @@ async def api_abuse_preview(request: Request):
 
 @app.post("/api-abuse/simulate")
 async def api_abuse_simulate(request: Request):
-    """Run the abuse detector on a scenario's payload, or on an edited payload.
-
-    Body: {profile?, events?, mode?, seed?} — when `events` is present it is
-    evaluated verbatim (same schema as /v1/abuse/events); otherwise the
-    profile is generated server-side.
-    """
+    # either a profile name or a raw events list from the editor
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be json"}})
 
     mode = str(body.get("mode") or "block").lower()
     if mode not in ("block", "monitor"):
@@ -943,24 +884,23 @@ async def api_abuse_simulate(request: Request):
     if isinstance(body.get("events"), list):
         events = body["events"]
         if not events:
-            return JSONResponse(status_code=422, content={"error": {"message": "events list is empty"}})
+            return JSONResponse(status_code=422, content={"error": {"message": "no events"}})
         if len(events) > 50000:
             return JSONResponse(status_code=422, content={"error": {"message": "too many events (max 50000)"}})
         if not all(isinstance(event, dict) for event in events):
-            return JSONResponse(status_code=422, content={"error": {"message": "every event must be a JSON object"}})
+            return JSONResponse(status_code=422, content={"error": {"message": "every event must be an object"}})
         profile_id = str(body.get("profile") or "custom")
     else:
         profile_id = body.get("profile")
         if profile_id not in abuse_demo.PROFILES:
             return JSONResponse(status_code=422, content={"error": {"message": "unknown profile %r" % profile_id}})
-        seed = int(body.get("seed") or 7)
-        events = _generate_profile(profile_id, seed)
+        events = _generate_profile(profile_id, int(body.get("seed") or 7))
 
     started = time.perf_counter()
     try:
         verdicts = await run_in_threadpool(abuse.check_events, events, mode)
     except (ValueError, TypeError) as exc:
-        return JSONResponse(status_code=422, content={"error": {"message": "invalid event payload: %s" % exc}})
+        return JSONResponse(status_code=422, content={"error": {"message": "bad event payload: %s" % exc}})
     elapsed = (time.perf_counter() - started) * 1000.0
     for verdict in verdicts:
         abuse_log.append(verdict, meta={"endpoint": "api-abuse/simulate", "profile": profile_id})
@@ -976,11 +916,10 @@ async def api_abuse_simulate(request: Request):
 
 @app.post("/api-abuse/live")
 async def api_abuse_live(request: Request):
-    """Send a scenario's HTTP requests for real, then score the captured telemetry."""
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be json"}})
 
     profile_id = str(body.get("profile") or "")
     plan = body.get("plan")
@@ -989,7 +928,7 @@ async def api_abuse_live(request: Request):
             return JSONResponse(status_code=422, content={"error": {"message": "unknown profile %r" % profile_id}})
         plan = _plan_for(profile_id, request)
     elif not isinstance(plan, dict):
-        return JSONResponse(status_code=422, content={"error": {"message": "plan must be a JSON object"}})
+        return JSONResponse(status_code=422, content={"error": {"message": "plan must be an object"}})
     if not profile_id:
         profile_id = "custom"
 
@@ -999,13 +938,13 @@ async def api_abuse_live(request: Request):
 
     client = str(plan.get("client_ip") or "").strip()
     if client:
-        abuse.reset_client(client)  # repeatable bench runs: start this client clean
+        abuse.reset_client(client)   # repeat runs start from a clean slate
 
     try:
         result = await _execute_plan(plan)
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"error": {"message": str(exc)}})
-    except Exception as exc:  # noqa: BLE001 — report execution failures to the bench
+    except Exception as exc:
         return JSONResponse(status_code=502, content={"error": {"message": "execution failed: %s" % exc}})
 
     verdicts = await run_in_threadpool(abuse.check_events, result["events"], mode)
@@ -1027,29 +966,28 @@ async def api_abuse_live(request: Request):
 
 @app.post("/api-abuse/unblock")
 async def api_abuse_unblock(request: Request):
-    """Lift a Laya block early (demo convenience)."""
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be json"}})
     client = body.get("client")
     if not client:
         return JSONResponse(status_code=422, content={"error": {"message": "client is required"}})
     return {"client": str(client), "unblocked": abuse.clear_block(str(client))}
 
 
-def main() -> int:
+def main():
     import argparse
 
-    ap = argparse.ArgumentParser(description="Laya Guard middleware", formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description="Laya Guard server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8978)
     args = ap.parse_args()
 
-    print("[guard] upstream: %s (%s)" % (UPSTREAM_BASE, UPSTREAM_MODEL), flush=True)
-    print("[guard] mode: %s | threshold: %s | model: %s" % (MODE, THRESHOLD, GUARD_MODEL), flush=True)
-    print("[guard] key env: %s (%s)" % (UPSTREAM_KEY_ENV, "set" if upstream_key() else "MISSING"), flush=True)
-    print("[guard] log: %s" % LOG_PATH, flush=True)
+    print("[guard] upstream %s (%s)" % (UPSTREAM_BASE, UPSTREAM_MODEL), flush=True)
+    print("[guard] mode %s | threshold %s | model %s" % (MODE, THRESHOLD, GUARD_MODEL), flush=True)
+    print("[guard] key env %s (%s)" % (UPSTREAM_KEY_ENV, "set" if upstream_key() else "MISSING"), flush=True)
+    print("[guard] log %s" % LOG_PATH, flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 

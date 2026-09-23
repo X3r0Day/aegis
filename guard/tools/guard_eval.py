@@ -7,11 +7,9 @@ sample.
 
     .venv/bin/python guard/tools/guard_eval.py
 
-Note: the state is passed as {"prompt": text} — raw-string states wreck the
+Note: the state is passed as {"prompt": text}. raw-string states wreck the
 answers (see guard/README.md).
 """
-from __future__ import annotations
-
 import os
 import sys
 from pathlib import Path

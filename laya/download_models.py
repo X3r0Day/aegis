@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""Download Laya checkpoints into ./models/laya (kept inside this folder).
+"""Fetch Laya checkpoints into ./models/laya.
 
-The Hugging Face repo (convaiinnovations/laya) bundles the whole family:
+The HF repo (convaiinnovations/laya) bundles the family:
 
-    english         421M  ModernBERT-large, 512 tok context   -> repo root
-    multilingual    322M  mmBERT-base, 1024 tok, 100+ langs   -> multilingual/
-    typed-decisions 421M  ModernBERT-large, decision workflows -> typed-decisions/
+    english         421M  ModernBERT-large, 512 ctx      repo root
+    multilingual    322M  mmBERT-base, 100+ langs        multilingual/
+    typed-decisions 421M  decision fine-tune             typed-decisions/
 
-Only the files matching --checkpoints are fetched, so the default download is
-~1.5 GB total (english + multilingual):
-    ./download_models.py                     # english + multilingual
-    ./download_models.py english             # english only
-    ./download_models.py --all               # every checkpoint
+Only the requested patterns get pulled, default is english + multilingual
+(~1.5 GB total):
+
+    ./download_models.py                 # english + multilingual
+    ./download_models.py english
+    ./download_models.py --all           # adds typed-decisions, another ~0.85 GB
 """
-from __future__ import annotations
-
 import argparse
 import os
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TARGET = HERE / "models" / "laya"
+TARGET = HERE / "models/laya"
 REPO_ID = "convaiinnovations/laya"
 
 CHECKPOINTS = {
@@ -35,34 +34,24 @@ CHECKPOINTS = {
 }
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    ap.add_argument(
-        "checkpoints",
-        nargs="*",
-        choices=[*CHECKPOINTS],
-        help="checkpoints to download (default: english multilingual)",
-    )
-    ap.add_argument("--all", action="store_true", help="download every checkpoint")
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("checkpoints", nargs="*", choices=[*CHECKPOINTS],
+                    help="what to download (default: english multilingual)")
+    ap.add_argument("--all", action="store_true")
     args = ap.parse_args()
 
     names = list(CHECKPOINTS) if args.all else (args.checkpoints or ["english", "multilingual"])
     patterns = [p for name in names for p in CHECKPOINTS[name]]
 
-    # Everything lands under ./models: no writes to ~/.cache/huggingface.
-    os.environ.setdefault("HF_HOME", str(HERE / "models" / "hf"))
+    # keep HF metadata under ./models instead of ~/.cache
+    os.environ.setdefault("HF_HOME", str(HERE / "models/hf"))
 
     from huggingface_hub import snapshot_download
 
     print("[laya] downloading %s" % ", ".join(names))
     print("[laya] -> %s" % TARGET)
-    path = snapshot_download(
-        REPO_ID,
-        allow_patterns=patterns,
-        local_dir=str(TARGET),
-    )
+    path = snapshot_download(REPO_ID, allow_patterns=patterns, local_dir=str(TARGET))
     print("[laya] done: %s" % path)
     return 0
 

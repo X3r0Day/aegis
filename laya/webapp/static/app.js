@@ -1,4 +1,4 @@
-/* Laya Playground — frontend. Plain DOM, no framework. */
+/* Laya Playground frontend, plain DOM, no framework. */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -95,7 +95,7 @@ function renderStatus(s) {
     const state = !info.present ? "off" : info.loaded ? "on" : "busy";
     const note = !info.present ? "not downloaded" : info.loaded ? "loaded" : "loading";
     const item = el("span", "s-item " + state);
-    item.title = `${name} — ${note}`;
+    item.title = `${name}: ${note}`;
     item.append(el("span", "sq"), document.createTextNode(name));
     frag.append(item);
   }
@@ -113,7 +113,7 @@ function renderStatus(s) {
     opt.disabled = !present;
     const label = opt.dataset.label || opt.textContent;
     opt.dataset.label = label;
-    opt.textContent = present ? label : `${label} — not downloaded`;
+    opt.textContent = present ? label : `${label} (not downloaded)`;
   }
   if (ui.modelSelect.selectedOptions[0]?.disabled) ui.modelSelect.value = "english";
 }
@@ -192,7 +192,7 @@ function renderBuilder() {
   ui.qCount.textContent = String(entries.length);
   ui.questionsBuilder.replaceChildren();
   if (!entries.length) {
-    ui.questionsBuilder.append(el("p", "crit-note", "No questions yet — use “+ add”."));
+    ui.questionsBuilder.append(el("p", "crit-note", "No questions yet, use “+ add”."));
     return;
   }
   entries.forEach(([qid, q], i) => {
@@ -224,7 +224,7 @@ function renderQuestion(qid, q, i) {
   const idRow = el("div", "field-row");
   const idInput = el("input", "qid");
   idInput.value = qid;
-  idInput.title = "Question id — becomes the key in the response";
+  idInput.title = "Question id, becomes the key in the response";
   const typeSel = el("select");
   for (const t of QTYPES) {
     const opt = el("option", null, t);
@@ -262,7 +262,7 @@ function renderQuestion(qid, q, i) {
       const rows = el("div", "crit-rows");
       for (const [key] of Object.entries(q.criteria)) rows.append(choiceRow(key));
       crit.append(rows);
-      crit.append(el("div", "crit-note", "each option is scored and softmaxed — the keys become the answer labels"));
+      crit.append(el("div", "crit-note", "each option is scored and softmaxed, the keys become the answer labels"));
       crit.append(addButton("+ option", () => {
         let n = Object.keys(q.criteria).length + 1;
         while (q.criteria["option_" + n]) n++;
@@ -290,11 +290,11 @@ function renderQuestion(qid, q, i) {
         rows.append(line);
       });
       crit.append(rows);
-      crit.append(el("div", "crit-note", "ordered levels 0…n — the answer is an expected value plus the full distribution"));
+      crit.append(el("div", "crit-note", "ordered levels 0..n, the answer is an expected value plus the full distribution"));
       crit.append(addButton("+ level", () => { q.criteria.push(""); drawCriteria(); }));
     } else {
       const note = el("div", "crit-note");
-      note.append("boolean question — answers with ");
+      note.append("boolean question, answers with ");
       note.append(el("b", null, "P(true)"));
       note.append(". custom yes/no wording lives in the json editor");
       crit.append(note);
@@ -487,7 +487,7 @@ async function run() {
     renderResults(data);
     refreshStatus();
   } catch (e) {
-    ui.results.replaceChildren(el("div", "error-note", "run failed — " + e.message));
+    ui.results.replaceChildren(el("div", "error-note", "run failed: " + e.message));
     ui.resultMeta.replaceChildren();
   } finally {
     app.running = false;
@@ -595,7 +595,7 @@ function save() {
         model: ui.modelSelect.value,
         tab: ui.tabQuestions.classList.contains("active") ? "questions" : "state",
       }));
-    } catch { /* storage unavailable — ignore */ }
+    } catch { /* storage unavailable, ignore */ }
   }, 350);
 }
 
@@ -625,7 +625,7 @@ function restore() {
       ui.questionsBuilder.classList.add("hidden");
       ui.questionsJsonToggle.textContent = "visual";
       ui.addQuestion.classList.add("hidden");
-    } catch { /* corrupt saved JSON — keep the preset questions */ }
+    } catch { /* corrupt saved JSON, keep preset questions */ }
   } else if (saved.questions && Object.keys(saved.questions).length) {
     setQuestions(saved.questions);
   }
@@ -647,7 +647,7 @@ ui.stateFormat.onclick = () => {
     ui.stateJson.value = pretty(JSON.parse(ui.stateJson.value));
     checkStateValidity();
   } catch {
-    toast("state is not valid JSON — it will be sent as plain text");
+    toast("state is not valid JSON, it will be sent as plain text");
   }
 };
 ui.rawToggle.onchange = () => {

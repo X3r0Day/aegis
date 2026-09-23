@@ -1,41 +1,26 @@
-"""The result of one guard check."""
-from __future__ import annotations
-
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 @dataclass
 class Verdict:
-    """Everything the guard decided, with enough context to log or display it.
-
-    `decision` is the model's determination. `enforced` says whether the
-    middleware actually dropped the request (block mode) or only flagged it
-    (monitor mode).
-    """
-
-    decision: str                      # "block" | "allow"
+    decision: str                      # block | allow
     blocked: bool
-    enforced: bool
-    mode: str                          # "block" | "monitor"
-    threshold: float                   # limit that fired (or the primary limit)
-    thresholds: Dict[str, float]       # per-question limits
-    probabilities: Dict[str, float]    # P(true) for each watched question
-    triggers: List[Dict[str, Any]]     # watched questions that crossed the threshold
-    confidences: Dict[str, float]      # per-question confidence
+    enforced: bool                     # what the middleware actually did
+    mode: str                          # block | monitor
+    threshold: float                   # the limit that fired
+    thresholds: dict[str, float]       # per question
+    probabilities: dict[str, float]    # P(true), watched questions
+    triggers: list[dict[str, Any]]     # watched questions over their limit
+    confidences: dict[str, float]
     model: str                         # checkpoint that answered
-    routing: Optional[Dict[str, Any]]  # full routing record (auto mode)
+    routing: dict[str, Any] | None
     latency_ms: float
     text_sha256: str
-    scope: Optional[str] = None        # how the scanned text was extracted
-    excerpt: Optional[str] = None      # only when the config asks for it
-    error: Optional[str] = None        # set when the check failed
-    note: Optional[str] = None         # e.g. a rule override applied on top of Laya
-
-    def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
-        data["label"] = self.label
-        return data
+    scope: str | None = None           # how the text was picked out
+    excerpt: str | None = None         # only if the config stores one
+    error: str | None = None
+    note: str | None = None            # rule override on top of Laya, if any
 
     @property
     def label(self) -> str:
@@ -44,3 +29,8 @@ class Verdict:
         if self.blocked:
             return "block" if self.enforced else "would-block"
         return "allow"
+
+    def to_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["label"] = self.label
+        return d

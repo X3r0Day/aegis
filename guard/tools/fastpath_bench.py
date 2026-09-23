@@ -5,8 +5,6 @@
 
 Requires guard/models/fastguard.joblib (run guard/tools/fastpath_train.py first).
 """
-from __future__ import annotations
-
 import os
 import statistics
 import sys
@@ -28,7 +26,7 @@ import guard_eval  # noqa: E402
 
 def main() -> int:
     if not FastGuard.available():
-        print("no artifact — run guard/tools/fastpath_train.py first")
+        print("no artifact, run guard/tools/fastpath_train.py first")
         return 1
 
     fast = FastGuard(threshold=0.5)

@@ -1,22 +1,10 @@
-"""API abuse detection from request telemetry.
+"""API abuse detection from gateway telemetry, metadata only, no bodies.
 
-The gateway ships one event per API request (metadata only — never bodies):
-
-    {"ts": 1730000000.0, "ip": "203.0.113.9", "method": "GET",
-     "path": "/api/v1/users/1042", "route": "/api/v1/users/{id}",
-     "status": 200, "latency_ms": 41.2, "bytes_in": 0, "bytes_out": 812,
-     "api_key_id": "k_9f2…", "user_agent": "python-requests/2.32",
-     "token_id": "t_…", "username": "alice@example.com",
-     "asn": "24940", "country": "DE", "datacenter": true, "in_flight": 7,
-     "client_age_s": 2592000, "prior_requests_24h": 172800, "prior_error_rate": 0.001}
-
-`TrafficAggregator` keeps sliding-window counters per client. `AbuseDetector`
-writes one dense, evidence-first client report and has Laya answer typed
-questions about it. Laya runs only when cheap triggers fire and the per-client
-cooldown has expired — never once per request.
+Events look like {"ts": ..., "ip": ..., "method": ..., "path": ...,
+"status": ..., "user_agent": ..., "api_key_id": ..., ...} and get folded into
+per client sliding windows. Laya only runs when cheap triggers fire and the
+client's cooldown is up, never once per request.
 """
-from __future__ import annotations
-
 import math
 import re
 import threading
@@ -24,7 +12,6 @@ import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from .config import DEFAULT_MODELS_DIR
 from .model import get_runner
@@ -40,11 +27,11 @@ _BROWSER_MARKERS = ("mozilla/", "chrome/", "safari/", "firefox/")
 _SCANNER_MARKERS = ("sqlmap", "nikto", "nmap", "masscan", "wpscan", "acunetix", "netsparker")
 
 
-def _now() -> float:
+def _now():
     return time.time()
 
 
-def _human_age(seconds: float) -> str:
+def _human_age(seconds):
     seconds = max(0.0, seconds)
     if seconds < 90:
         return "%.0fs" % seconds
@@ -55,37 +42,36 @@ def _human_age(seconds: float) -> str:
     return "%.1fd" % (seconds / 86400)
 
 
-# --------------------------------------------------------------------- events
 @dataclass
 class Event:
     ts: float
     ip: str = "0.0.0.0"
     method: str = "GET"
     path: str = "/"
-    route: Optional[str] = None
+    route: str | None = None
     status: int = 0
-    latency_ms: Optional[float] = None
+    latency_ms: float | None = None
     bytes_in: int = 0
     bytes_out: int = 0
-    api_key_id: Optional[str] = None
-    user_agent: Optional[str] = None
-    token_id: Optional[str] = None
-    username: Optional[str] = None
-    asn: Optional[str] = None
-    country: Optional[str] = None
-    datacenter: Optional[bool] = None
-    in_flight: Optional[int] = None
-    client_age_s: Optional[float] = None
-    prior_requests_24h: Optional[int] = None
-    prior_error_rate: Optional[float] = None
+    api_key_id: str | None = None
+    user_agent: str | None = None
+    token_id: str | None = None
+    username: str | None = None
+    asn: str | None = None
+    country: str | None = None
+    datacenter: bool | None = None
+    in_flight: int | None = None
+    client_age_s: float | None = None
+    prior_requests_24h: int | None = None
+    prior_error_rate: float | None = None
 
     @classmethod
-    def from_dict(cls, raw: Dict[str, Any]) -> "Event":
+    def from_dict(cls, raw):
         ts = raw.get("ts", raw.get("timestamp"))
         if ts is None:
             raise ValueError("event is missing 'ts'")
         ts = float(ts)
-        if ts > 1e12:  # milliseconds
+        if ts > 1e12:          # someone sent milliseconds
             ts /= 1000.0
         return cls(
             ts=ts,
@@ -111,19 +97,19 @@ class Event:
         )
 
     @property
-    def client_key(self) -> str:
+    def client_key(self):
         return str(self.api_key_id) if self.api_key_id else self.ip
 
     @property
-    def endpoint_key(self) -> str:
-        """Route when the gateway supplies one, else path with ids masked."""
+    def endpoint_key(self):
+        # gateway route if we have one, otherwise mask the id in the path
         if self.route:
             return self.route
         match = _NUMERIC_SUFFIX.match(self.path)
         return match.group(1) + "{id}" if match else self.path
 
 
-def _opt_float(value: Any) -> Optional[float]:
+def _opt_float(value):
     if value is None:
         return None
     try:
@@ -132,53 +118,52 @@ def _opt_float(value: Any) -> Optional[float]:
         return None
 
 
-# ------------------------------------------------------------- client state
 class ClientState:
     def __init__(self):
-        self.first_seen: float = 0.0
-        self.last_seen: float = 0.0
-        self.total: int = 0
-        self.ip: str = ""
-        self.asn: Optional[str] = None
-        self.country: Optional[str] = None
-        self.datacenter: Optional[bool] = None
-        self.api_key_id: Optional[str] = None
-        self.client_age_s: Optional[float] = None
-        self.prior_requests_24h: Optional[int] = None
-        self.prior_error_rate: Optional[float] = None
-        self.seconds: Dict[int, int] = {}
-        self.minutes: Dict[int, int] = {}
-        self.peak_1s: int = 0
-        self.path_counts: Dict[str, int] = {}
-        self.endpoint_counts: Dict[str, int] = {}
-        self.endpoint_status: Dict[str, Dict[int, int]] = {}
-        self.endpoint_paths: Dict[str, Set[str]] = {}
-        self.endpoint_path_overflow: Set[str] = set()
-        self.path_first_seen: Dict[str, float] = {}
-        self.status: Dict[str, int] = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
-        self.status_exact: Dict[int, int] = {}
-        self.methods: Dict[str, int] = {}
-        self.auth_fail: int = 0
-        self.auth_fail_on_auth: int = 0
-        self.bytes_in: int = 0
-        self.bytes_out: int = 0
-        self.max_bytes_in: int = 0
-        self.max_bytes_out: int = 0
-        self.ua_seen: Dict[str, int] = {}
-        self.ua_missing: int = 0
-        self.timestamps: Deque[float] = deque(maxlen=256)
-        self.id_events: Deque[Tuple[str, int]] = deque(maxlen=500)
-        self.max_in_flight: Optional[int] = None
-        self.api_keys: Set[str] = set()
-        self.tokens: Set[str] = set()
-        self.usernames: Set[str] = set()
-        self.usernames_total: int = 0
-        self.last_eval_ts: float = 0.0
-        self.last_verdict: Optional[Dict[str, Any]] = None
+        self.first_seen = 0.0
+        self.last_seen = 0.0
+        self.total = 0
+        self.ip = ""
+        self.asn = None
+        self.country = None
+        self.datacenter = None
+        self.api_key_id = None
+        self.client_age_s = None
+        self.prior_requests_24h = None
+        self.prior_error_rate = None
+        self.seconds = {}              # second bucket -> count, 1h
+        self.minutes = {}              # minute bucket -> count, 24h
+        self.peak_1s = 0
+        self.path_counts = {}
+        self.endpoint_counts = {}
+        self.endpoint_status = {}
+        self.endpoint_paths = {}
+        self.endpoint_path_overflow = set()
+        self.path_first_seen = {}
+        self.status = {"2xx": 0, "3xx": 0, "4xx": 0, "5xx": 0}
+        self.status_exact = {}
+        self.methods = {}
+        self.auth_fail = 0
+        self.auth_fail_on_auth = 0
+        self.bytes_in = 0
+        self.bytes_out = 0
+        self.max_bytes_in = 0
+        self.max_bytes_out = 0
+        self.ua_seen = {}
+        self.ua_missing = 0
+        self.timestamps = deque(maxlen=256)
+        self.id_events = deque(maxlen=500)
+        self.max_in_flight = None
+        self.api_keys = set()
+        self.tokens = set()
+        self.usernames = set()
+        self.usernames_total = 0
+        self.last_eval_ts = 0.0
+        self.last_verdict = None
 
-    # -- ingest ------------------------------------------------------------
-    def add(self, event: Event) -> None:
+    def add(self, event):
         if not self.first_seen:
+            # gateways that know the client age can backdate first_seen
             self.first_seen = event.ts - (event.client_age_s or 0.0)
             self.ip = event.ip
         self.last_seen = max(self.last_seen, event.ts)
@@ -202,8 +187,7 @@ class ClientState:
 
         sec = int(event.ts)
         self.seconds[sec] = self.seconds.get(sec, 0) + 1
-        minute = int(event.ts // 60)
-        self.minutes[minute] = self.minutes.get(minute, 0) + 1
+        self.minutes[int(event.ts // 60)] = self.minutes.get(int(event.ts // 60), 0) + 1
         self.peak_1s = max(self.peak_1s, self.seconds[sec])
 
         self._bump(self.path_counts, event.path, cap=3000)
@@ -226,8 +210,8 @@ class ClientState:
         self.status_exact[event.status] = self.status_exact.get(event.status, 0) + 1
         if event.status in (401, 403):
             self.auth_fail += 1
-            low_path = event.path.lower()
-            if any(token in low_path for token in ("login", "auth", "token", "session", "signin", "sign-in")):
+            low = event.path.lower()
+            if any(tok in low for tok in ("login", "auth", "token", "session", "signin", "sign-in")):
                 self.auth_fail_on_auth += 1
 
         self.methods[event.method] = self.methods.get(event.method, 0) + 1
@@ -250,7 +234,8 @@ class ClientState:
             self.max_in_flight = max(self.max_in_flight or 0, event.in_flight)
 
     @staticmethod
-    def _bump(mapping: Dict[str, int], key: str, cap: int) -> None:
+    def _bump(mapping, key, cap):
+        # keep a bounded number of distinct keys, everything else goes to (other)
         if key in mapping:
             mapping[key] += 1
         elif len(mapping) < cap:
@@ -258,8 +243,7 @@ class ClientState:
         else:
             mapping["(other)"] = mapping.get("(other)", 0) + 1
 
-    # -- queries -----------------------------------------------------------
-    def prune(self, now: float) -> None:
+    def prune(self, now):
         sec_floor = int(now) - 3600
         for key in [k for k in self.seconds if k < sec_floor]:
             del self.seconds[key]
@@ -267,26 +251,26 @@ class ClientState:
         for key in [k for k in self.minutes if k < min_floor]:
             del self.minutes[key]
 
-    def count_window(self, now: float, window_s: float) -> int:
+    def count_window(self, now, window_s):
         if window_s <= 3600:
             floor = int(now) - int(window_s) + 1
             return sum(v for k, v in self.seconds.items() if k >= floor)
         floor = int((now - window_s) // 60)
         return sum(v for k, v in self.minutes.items() if k >= floor)
 
-    def rate_per_minute(self, now: float, window_s: float = 60.0) -> float:
+    def rate_per_minute(self, now, window_s=60.0):
         return self.count_window(now, window_s) * (60.0 / window_s)
 
-    def status_rates(self) -> Dict[str, float]:
+    def status_rates(self):
         total = sum(self.status.values()) or 1
         return {k: v / total for k, v in self.status.items()}
 
-    def new_paths_window(self, now: float, window_s: float) -> int:
+    def new_paths_window(self, now, window_s):
         floor = now - window_s
         return sum(1 for ts in self.path_first_seen.values() if ts >= floor)
 
-    def inter_arrival(self) -> Optional[Tuple[float, float, float, float, int]]:
-        """(mean, min, max, CV, n) of inter-arrival gaps in seconds."""
+    def inter_arrival(self):
+        # (mean, min, max, CV, n) in seconds
         stamps = sorted(self.timestamps)
         if len(stamps) < 8:
             return None
@@ -299,8 +283,8 @@ class ClientState:
         var = sum((d - mean) ** 2 for d in diffs) / len(diffs)
         return mean, min(diffs), max(diffs), math.sqrt(var) / mean, len(diffs)
 
-    def id_step_score(self) -> Optional[float]:
-        last: Dict[str, int] = {}
+    def id_step_score(self):
+        last = {}
         hits = checks = 0
         first = last_ident = None
         for prefix, ident in self.id_events:
@@ -315,30 +299,28 @@ class ClientState:
         self._id_span = (first, last_ident) if checks else None
         return (hits / checks) if checks >= 5 else None
 
-    def id_span(self) -> Optional[Tuple[int, int]]:
-        span = getattr(self, "_id_span", None)
-        return span
+    def id_span(self):
+        return getattr(self, "_id_span", None)
 
-    def tool_uas(self) -> List[str]:
+    def tool_uas(self):
         found = []
         for ua in self.ua_seen:
             low = ua.lower()
-            if any(marker in low for marker in _TOOL_MARKERS):
+            if any(m in low for m in _TOOL_MARKERS):
                 found.append(ua[:60])
         return found[:3]
 
-    def browser_like(self) -> bool:
+    def browser_like(self):
         return any(any(m in ua.lower() for m in _BROWSER_MARKERS) for ua in self.ua_seen)
 
 
-# --------------------------------------------------------------- aggregator
 class TrafficAggregator:
-    def __init__(self, max_clients: int = 10000):
-        self.clients: Dict[str, ClientState] = {}
+    def __init__(self, max_clients=10000):
+        self.clients = {}
         self.max_clients = max_clients
 
-    def observe(self, events: Iterable[Event]) -> List[str]:
-        touched: List[str] = []
+    def observe(self, events):
+        touched = []
         for event in events:
             key = event.client_key
             state = self.clients.get(key)
@@ -351,72 +333,68 @@ class TrafficAggregator:
             touched.append(key)
         return touched
 
-    def prune(self, now: Optional[float] = None) -> None:
+    def prune(self, now=None):
         now = now or _now()
         for state in self.clients.values():
             state.prune(now)
 
 
-# --------------------------------------------------------------------- config
 @dataclass
 class AbuseConfig:
-    # typed-decisions (English, security-incident fine-tune) measured best on
-    # the synthetic suite: benign abuse-score <= 0.35, attacks >= 0.55.
-    # Recalibrate `threshold` on real traffic before enforcing.
+    # typed-decisions measured best on the synthetic suite: benign abuse score
+    # stays under 0.35, attacks come in over 0.55. recalibrate threshold on
+    # real traffic before switching mode to block
     models_dir: Path = DEFAULT_MODELS_DIR
-    model: str = "typed-decisions"           # typed-decisions | english | multilingual
-    threshold: float = 0.45                  # required abuse score (mean of is_abuse, true_positive)
-    severity_floor: float = 1.0              # second gate for enforcement
-    mode: str = "monitor"                    # block | monitor
-    cooldown_s: float = 60.0                 # min seconds between Laya evals per client
-    state_key: str = "traffic"               # key the narrative is wrapped in
+    model: str = "typed-decisions"
+    threshold: float = 0.45            # mean of is_abuse and true_positive
+    severity_floor: float = 1.0        # severity gate for enforcement
+    mode: str = "monitor"
+    cooldown_s: float = 60.0           # min gap between Laya evals per client
+    state_key: str = "traffic"
     features_window_s: float = 60.0
-    device: Optional[str] = None
+    device: str | None = None
 
 
-# ------------------------------------------------------------- abuse verdict
 @dataclass
 class AbuseVerdict:
     client: str
-    decision: str                            # "block" | "allow"
+    decision: str
     enforced: bool
     mode: str
     threshold: float
-    abuse_score: float                       # mean of is_abuse and true_positive
+    abuse_score: float
     is_abuse: float
     true_positive: float
     severity: float
     category: str
     pattern: str
-    action: str                             # Laya's advisory action
-    recommended_action: str                  # what the policy suggests
-    probabilities: Dict[str, Any]
-    confidences: Dict[str, float]
+    action: str                    # what Laya suggested
+    recommended_action: str        # what the policy does with it
+    probabilities: dict
+    confidences: dict
     model: str
-    routing: Optional[Dict[str, Any]]
+    routing: dict | None
     latency_ms: float
     narrative: str
-    features: Dict[str, Any]
-    triggered_by: List[str] = field(default_factory=list)
-    error: Optional[str] = None
+    features: dict
+    triggered_by: list = field(default_factory=list)
+    error: str | None = None
 
     @property
-    def label(self) -> str:
+    def label(self):
         if self.error:
             return "error"
         if self.decision == "block":
             return "block" if self.enforced else "would-block"
         return "allow"
 
-    def to_dict(self) -> Dict[str, Any]:
-        data = asdict(self)
-        data["label"] = self.label
-        return data
+    def to_dict(self):
+        d = asdict(self)
+        d["label"] = self.label
+        return d
 
 
-# ---------------------------------------------------------------- questions
-def abuse_questions() -> Dict[str, Dict[str, Any]]:
-    """Guard questions asked about one client's traffic report (`traffic`)."""
+def abuse_questions():
     return {
         "category": {
             "type": "choice",
@@ -461,26 +439,21 @@ def abuse_questions() -> Dict[str, Dict[str, Any]]:
     }
 
 
-# ----------------------------------------------------------------- detector
 class AbuseDetector:
-    """Aggregate telemetry + Laya decisions for API abuse."""
-
-    def __init__(self, config: Optional[AbuseConfig] = None,
-                 aggregator: Optional[TrafficAggregator] = None):
+    def __init__(self, config=None, aggregator=None):
         self.cfg = config or AbuseConfig()
         self.agg = aggregator or TrafficAggregator()
         self.questions = abuse_questions()
         self._runner = None
         self._load_lock = threading.Lock()
         self._infer_lock = threading.Lock()
-        self._data_lock = threading.RLock()   # aggregator mutations vs feature reads
-        self._blocks: Dict[str, Dict[str, Any]] = {}
+        self._data_lock = threading.RLock()   # ingest runs on the loop, evals on threads
+        self._blocks = {}
 
-    # -------------------------------------------------------------- enforcement
-    def block_client(self, client_key: str, ttl_s: float, *, category: str = "", score: float = 0.0) -> None:
+    def block_client(self, client_key, ttl_s, *, category="", score=0.0):
         self._blocks[client_key] = {"until": _now() + ttl_s, "category": category, "score": score}
 
-    def block_state(self, client_key: str) -> Optional[Dict[str, Any]]:
+    def block_state(self, client_key):
         block = self._blocks.get(client_key)
         if not block:
             return None
@@ -490,17 +463,17 @@ class AbuseDetector:
             return None
         return {"category": block["category"], "score": block["score"], "remaining_s": round(remaining, 1)}
 
-    def clear_block(self, client_key: str) -> bool:
+    def clear_block(self, client_key):
         return self._blocks.pop(client_key, None) is not None
 
-    def reset_client(self, client_key: str) -> bool:
-        """Drop a client's aggregates and block (used by the bench before a run)."""
+    def reset_client(self, client_key):
+        # bench helper: start a scenario client from scratch
         with self._data_lock:
             removed = self.agg.clients.pop(client_key, None) is not None
         self.clear_block(client_key)
         return removed
 
-    def blocked_clients(self) -> Dict[str, Dict[str, Any]]:
+    def blocked_clients(self):
         out = {}
         for key in list(self._blocks):
             state = self.block_state(key)
@@ -508,34 +481,31 @@ class AbuseDetector:
                 out[key] = state
         return out
 
-    # ------------------------------------------------------------------ runner
     def _ensure_runner(self):
         with self._load_lock:
             if self._runner is None:
                 self._runner = get_runner(self.cfg.models_dir, self.cfg.device)
             return self._runner
 
-    def warm(self) -> "AbuseDetector":
-        runner = self._ensure_runner()
-        runner.load("english")
+    def warm(self):
+        self._ensure_runner().load("english")
         return self
 
     @property
-    def loaded_models(self) -> List[str]:
+    def loaded_models(self):
         return self._runner.loaded if self._runner is not None else []
 
-    # ------------------------------------------------------------------ ingest
-    def observe(self, raw_events: Iterable[Dict[str, Any]]) -> List[str]:
+    def observe(self, raw_events):
         events = [Event.from_dict(e) for e in raw_events]
         with self._data_lock:
             return self.agg.observe(events)
 
-    def trigger_reasons(self, client_key: str, now: Optional[float] = None) -> List[str]:
+    def trigger_reasons(self, client_key, now=None):
         now = now or _now()
         with self._data_lock:
             return self._trigger_reasons(self.agg.clients[client_key], now)
 
-    def triggered_clients(self, now: Optional[float] = None) -> List[str]:
+    def triggered_clients(self, now=None):
         now = now or _now()
         out = []
         with self._data_lock:
@@ -546,7 +516,7 @@ class AbuseDetector:
                     out.append(key)
         return out
 
-    def _trigger_reasons(self, state: ClientState, now: float) -> List[str]:
+    def _trigger_reasons(self, state, now):
         n60 = state.count_window(now, 60)
         if n60 < 30:
             return []
@@ -570,8 +540,7 @@ class AbuseDetector:
             reasons.append("concurrency")
         return reasons
 
-    def evaluate_triggered(self, mode: Optional[str] = None,
-                           now: Optional[float] = None) -> List[AbuseVerdict]:
+    def evaluate_triggered(self, mode=None, now=None):
         now = now or _now()
         verdicts = []
         for key in self.triggered_clients(now):
@@ -581,18 +550,18 @@ class AbuseDetector:
                 verdicts.append(verdict)
         return verdicts
 
-    # --------------------------------------------------------------- features
-    def features(self, client_key: str, now: Optional[float] = None) -> Dict[str, Any]:
+    def features(self, client_key, now=None):
         now = now or _now()
         with self._data_lock:
             return self._features_unlocked(client_key, now)
 
-    def _features_unlocked(self, client_key: str, now: float) -> Dict[str, Any]:
+    def _features_unlocked(self, client_key, now):
         state = self.agg.clients[client_key]
         window = self.cfg.features_window_s
         n60 = state.count_window(now, window)
         total = state.total or 1
-        # short-lived clients (< window) are rated over the span we observed
+        # a client younger than the window gets rated over the span we saw,
+        # otherwise short runs come out understated
         observed = max(1.0, min(window, now - state.first_seen))
         rate60 = n60 / observed
         own_rate = state.rate_per_minute(now, 86400)
@@ -605,18 +574,16 @@ class AbuseDetector:
         endpoints = []
         for endpoint, count in sorted(state.endpoint_counts.items(), key=lambda kv: -kv[1])[:2]:
             statuses = sorted(state.endpoint_status.get(endpoint, {}).items(), key=lambda kv: -kv[1])[:3]
-            distinct = len(state.endpoint_paths.get(endpoint, ()))
-            overflow = endpoint in state.endpoint_path_overflow
             endpoints.append({
                 "endpoint": endpoint,
                 "count": count,
                 "share": count / total,
                 "statuses": statuses,
-                "distinct_paths": distinct,
-                "overflow": overflow,
+                "distinct_paths": len(state.endpoint_paths.get(endpoint, ())),
+                "overflow": endpoint in state.endpoint_path_overflow,
             })
 
-        features: Dict[str, Any] = {
+        f = {
             "client": client_key,
             "ip": state.ip,
             "first_seen_age_s": now - state.first_seen,
@@ -664,15 +631,13 @@ class AbuseDetector:
             "country": state.country,
             "datacenter": state.datacenter,
         }
-        features["flags"] = self._flags(state, now, features)
-        features["pattern"] = self._pattern(state, now, features)
-        return features
+        f["flags"] = self._flags(state, now, f)
+        f["pattern"] = self._pattern(state, now, f)
+        return f
 
-    def _population(self, now: float) -> Dict[str, float]:
-        rates = []
-        for state in self.agg.clients.values():
-            if now - state.last_seen <= 300:
-                rates.append(state.rate_per_minute(now, 60))
+    def _population(self, now):
+        rates = [s.rate_per_minute(now, 60) for s in self.agg.clients.values()
+                 if now - s.last_seen <= 300]
         if not rates:
             return {"p50": 0.0, "p95": 0.0, "clients": 0}
         rates.sort()
@@ -683,7 +648,7 @@ class AbuseDetector:
         }
 
     @staticmethod
-    def _flags(state: ClientState, now: float, f: Dict[str, Any]) -> List[str]:
+    def _flags(state, now, f):
         flags = []
         n60 = f["n_window"]
         rate60 = f["rate_per_s"]
@@ -715,8 +680,8 @@ class AbuseDetector:
         return flags
 
     @staticmethod
-    def _pattern(state: ClientState, now: float, f: Dict[str, Any]) -> str:
-        """Name the dominant signature; the name matches the category vocabulary."""
+    def _pattern(state, now, f):
+        # the dominant signature, named with the same words as the category options
         sr = f["status_rates"]
         inter = f["inter_arrival"]
         if f["auth_fail_on_auth"] >= 15 and sr.get("4xx", 0) >= 0.3:
@@ -738,14 +703,10 @@ class AbuseDetector:
             return "normal_use (varied endpoints at a human pace)"
         return "mixed_use (no single dominant signature)"
 
-    # -------------------------------------------------------------- narrative
-    def render_state(self, f: Dict[str, Any]) -> str:
-        """Prose narrative in the model's own language.
-
-        Measured best on the synthetic suite (structured digit-dense reports
-        confused the checkpoint); every fact carries its unit and baseline.
-        """
-        s: List[str] = []
+    def render_state(self, f):
+        # prose beats dense tables here. the checkpoint read structured number
+        # soup close to chance while this wording separates cleanly
+        s = []
         if (f["client_age_s"] or 0) > 86400:
             s.append("This client has used the API for %d days." % (f["client_age_s"] / 86400))
         else:
@@ -824,7 +785,7 @@ class AbuseDetector:
         ua = f["ua_top"][0][0] if f["ua_top"] else None
         if ua:
             low = ua.lower()
-            if any(marker in low for marker in _SCANNER_MARKERS):
+            if any(m in low for m in _SCANNER_MARKERS):
                 label = "a known attack scanner"
             elif f["tool_uas"]:
                 label = "an automation library"
@@ -835,9 +796,7 @@ class AbuseDetector:
             s.append('It identifies itself as "%s" (%s).' % (ua, label))
         return " ".join(s)
 
-    # -------------------------------------------------------------- evaluate
-    def evaluate(self, client_key: str, *, force: bool = False, mode: Optional[str] = None,
-                 now: Optional[float] = None, triggered_by: Optional[List[str]] = None) -> Optional[AbuseVerdict]:
+    def evaluate(self, client_key, *, force=False, mode=None, now=None, triggered_by=None):
         cfg = self.cfg
         now = now or _now()
         with self._data_lock:
@@ -853,16 +812,15 @@ class AbuseDetector:
 
         started = time.perf_counter()
         try:
-            runner = self._ensure_runner()
             with self._infer_lock:
-                result = runner.predict(
+                result = self._ensure_runner().predict(
                     {cfg.state_key: narrative},
                     self.questions,
                     model=None if cfg.model == "auto" else cfg.model,
                 )
             answers = result["answers"]
             routing = result.get("routing") or {}
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             verdict = AbuseVerdict(
                 client=client_key, decision="allow", enforced=False, mode=mode,
                 threshold=cfg.threshold, abuse_score=0.0, is_abuse=0.0, true_positive=0.0,
@@ -931,9 +889,8 @@ class AbuseDetector:
             state.last_verdict = verdict.to_dict()
         return verdict
 
-    # ------------------------------------------------------------- conveniences
-    def check_events(self, raw_events: Iterable[Dict[str, Any]], mode: Optional[str] = None) -> List[AbuseVerdict]:
-        """Evaluate a standalone batch of events (request-file / demo path)."""
+    def check_events(self, raw_events, mode=None):
+        # standalone batch, temp aggregator, request files and the bench use this
         temp = AbuseDetector(self.cfg, aggregator=TrafficAggregator())
         temp.observe(raw_events)
         now = max((s.last_seen for s in temp.agg.clients.values()), default=_now())
@@ -945,7 +902,7 @@ class AbuseDetector:
                 verdicts.append(verdict)
         return verdicts
 
-    def clients(self, top: int = 20, now: Optional[float] = None) -> List[Dict[str, Any]]:
+    def clients(self, top=20, now=None):
         now = now or _now()
         rows = []
         with self._data_lock:
@@ -966,4 +923,4 @@ class AbuseDetector:
                     "blocked_for_s": block["remaining_s"] if block else None,
                 })
         rows.sort(key=lambda r: (-(r["is_abuse"] or 0), -r["rate_per_min"]))
-        return rows[: max(1, min(top, 200))]
+        return rows[:max(1, min(top, 200))]

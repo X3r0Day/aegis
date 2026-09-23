@@ -1,4 +1,4 @@
-/* Laya Guard chat — conversations + guard verdicts. No framework. */
+/* Laya Guard chat. */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -212,8 +212,8 @@ function renderMessage(msg) {
     const card = el("div", "block-card");
     const label = verdictLabel(msg.verdict);
     const head = el("div", "head", label === "would-block"
-      ? "⚠ Laya Guard flagged this message (monitor mode — forwarded anyway)"
-      : "⛔ Blocked by Laya Guard — prompt injection");
+      ? "⚠ Laya Guard flagged this message (monitor mode, forwarded anyway)"
+      : "⛔ Blocked by Laya Guard: prompt injection");
     card.append(head);
     const trig = (msg.verdict && msg.verdict.triggers || []).map((t) => `${t.question} = ${Number(t.probability).toFixed(2)}`).join(", ");
     if (trig) card.append(el("div", "detail", trig));
@@ -312,7 +312,7 @@ async function send() {
       conv.messages.push({ role: "error", content: `${res.status}: ${message}`, ts: Date.now() });
     }
   } catch (err) {
-    conv.messages.push({ role: "error", content: "network error — " + err.message, ts: Date.now() });
+    conv.messages.push({ role: "error", content: "network error: " + err.message, ts: Date.now() });
   } finally {
     state.sending = false;
     setBusy(false);
@@ -378,7 +378,7 @@ async function refreshHealth() {
       ui.banner.replaceChildren();
       ui.banner.append(
         el("b", null, h.key_env + " is not set on the server."),
-        document.createTextNode(" Clean requests cannot be answered — blocked requests are still stopped. Restart with: export " + h.key_env + "=…"),
+        document.createTextNode(" Clean requests cannot be answered. Blocked requests are still stopped. Restart with: export " + h.key_env + "=…"),
       );
       ui.banner.classList.remove("hidden");
     } else {

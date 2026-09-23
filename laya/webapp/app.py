@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
-"""Laya Playground — interactive web UI for the local System 1 decision model.
+"""Playground server for experimenting with the local Laya model.
 
-Run:
-    .venv/bin/python webapp/app.py            # http://127.0.0.1:8765
-    .venv/bin/python webapp/app.py --port 9000
+    ../.venv/bin/python webapp/app.py            # http://127.0.0.1:8765
+    ../.venv/bin/python webapp/app.py --port 9000
 
-The server keeps everything local: checkpoints come from ../models/laya, no
-network access is needed at runtime. Inference is serialised (one forward pass
-at a time) because the models run on CPU.
+checkpoints come from ../models/laya, nothing here talks to the network.
+inference is serialized because it all runs on the CPU.
 """
-from __future__ import annotations
-
 import os
 import sys
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
 
-HERE = Path(__file__).resolve().parent          # .../laya/webapp
-ROOT = HERE.parent                              # .../laya
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
 
-# Same environment tricks as the CLI: no TF probing, model metadata stays local.
+# same env tricks as the CLI: no TF probing, HF metadata stays local
 os.environ.setdefault("USE_TF", "0")
-os.environ.setdefault("HF_HOME", str(ROOT / "models" / "hf"))
-sys.path.insert(0, str(ROOT))                   # so `import scenarios` resolves
+os.environ.setdefault("HF_HOME", str(ROOT / "models/hf"))
+sys.path.insert(0, str(ROOT))       # for `import scenarios`
 
 import torch  # noqa: E402
 import uvicorn  # noqa: E402
@@ -45,21 +40,18 @@ from laya import (  # noqa: E402
 )
 import scenarios  # noqa: E402
 
-MODEL_DIR = ROOT / "models" / "laya"
+MODEL_DIR = ROOT / "models/laya"
 STATIC_DIR = HERE / "static"
 
 QTYPES = ("choice", "score", "noul")
 MODELS = ("auto", "english", "multilingual")
 
-
-# --------------------------------------------------------------------- runtime
-_router: Optional[Router] = None
+_router = None
 _router_lock = threading.Lock()
 _predict_lock = threading.Lock()
 
 
-def get_router() -> Router:
-    """Build the router exactly once, pointed at the local checkpoints."""
+def get_router():
     global _router
     with _router_lock:
         if _router is None:
@@ -74,22 +66,22 @@ def get_router() -> Router:
     return _router
 
 
-def _checkpoint_present(name: str) -> bool:
+def _checkpoint_present(name):
     if name == "english":
         return (MODEL_DIR / "model.safetensors").is_file()
     if name == "multilingual":
-        return (MODEL_DIR / "multilingual" / "model.safetensors").is_file()
+        return (MODEL_DIR / "multilingual/model.safetensors").is_file()
     return (MODEL_DIR / name / "model.safetensors").is_file()
 
 
-def _preload() -> None:
-    """Load + warm the English checkpoint in the background at startup."""
+def _preload():
+    # build the english checkpoint in the background so the first click is fast
     try:
         agent = get_router().load("english")
         agent.predict({"warmup": True},
                       {"ready": {"type": "noul", "instructions": "Is the model warm?"}})
-        print("[webapp] english checkpoint loaded and warmed", flush=True)
-    except Exception as exc:  # keep the server up so /api/status can report it
+        print("[webapp] english loaded and warmed", flush=True)
+    except Exception as exc:
         print("[webapp] preload failed: %r" % exc, flush=True)
 
 
@@ -102,8 +94,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Laya Playground", version="1.0", lifespan=lifespan)
 
 
-# ----------------------------------------------------------------- validation
-def _validate_questions(questions: Any) -> None:
+def _validate_questions(questions):
     if not isinstance(questions, dict) or not questions:
         raise HTTPException(422, "questions must be a non-empty JSON object")
     if len(questions) > 32:
@@ -121,38 +112,36 @@ def _validate_questions(questions: Any) -> None:
         criteria = q.get("criteria")
         if qtype == "choice":
             if not isinstance(criteria, dict) or len(criteria) < 2:
-                raise HTTPException(422, "question %r: choice questions need >=2 criteria options" % qid)
+                raise HTTPException(422, "question %r: choice needs at least 2 options" % qid)
         elif qtype == "score":
             if not isinstance(criteria, list) or len(criteria) < 2:
-                raise HTTPException(422, "question %r: score questions need >=2 ordered levels" % qid)
+                raise HTTPException(422, "question %r: score needs at least 2 levels" % qid)
 
 
-def _validate_state(state: Any) -> None:
+def _validate_state(state):
     if isinstance(state, str):
         if len(state) > 250_000:
-            raise HTTPException(422, "state is too large (max 250k characters)")
+            raise HTTPException(422, "state is too large (max 250k chars)")
         return
     if isinstance(state, (dict, list)):
         return
-    raise HTTPException(422, "state must be a string, JSON object or JSON array")
+    raise HTTPException(422, "state must be a string, object or array")
 
 
-# --------------------------------------------------------------------- models
 class PredictIn(BaseModel):
-    state: Any
-    questions: Any
+    state: object
+    questions: object
     model: str = "auto"
 
 
 class PredictOut(BaseModel):
     model: str
-    answers: Any
-    usage: Any
-    routing: Any = None
+    answers: object
+    usage: object
+    routing: object = None
     latency_ms: float
 
 
-# -------------------------------------------------------------------- routes
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
@@ -160,8 +149,7 @@ def index():
 
 @app.get("/api/status")
 def status():
-    router = _router
-    loaded = router.loaded if router is not None else []
+    loaded = _router.loaded if _router is not None else []
     return {
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "checkpoints": {
@@ -176,9 +164,9 @@ def status():
 def presets():
     return {
         "models": [
-            {"id": "auto", "name": "Auto — route by detected language"},
-            {"id": "english", "name": "English — ModernBERT-large (421M)"},
-            {"id": "multilingual", "name": "Multilingual — mmBERT-base (322M)"},
+            {"id": "auto", "name": "Auto (route by language)"},
+            {"id": "english", "name": "English, ModernBERT-large (421M)"},
+            {"id": "multilingual", "name": "Multilingual, mmBERT-base (322M)"},
         ],
         "scenarios": [
             {
@@ -219,7 +207,7 @@ def presets():
             {
                 "id": "llm_router",
                 "name": "LLM request routing",
-                "description": "Estimate difficulty/domain to route a request to the right model.",
+                "description": "Estimate difficulty and domain to route a request to the right model.",
                 "state": scenarios.MODEL_REQUEST,
                 "questions": router_questions(),
             },
@@ -254,11 +242,8 @@ def predict(req: PredictIn):
     router = get_router()
     t0 = time.perf_counter()
     with _predict_lock:
-        result = router.predict(
-            req.state,
-            req.questions,
-            model=None if req.model == "auto" else req.model,
-        )
+        result = router.predict(req.state, req.questions,
+                                model=None if req.model == "auto" else req.model)
     latency = (time.perf_counter() - t0) * 1000.0
 
     return PredictOut(
@@ -273,7 +258,7 @@ def predict(req: PredictIn):
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-def main() -> int:
+def main():
     import argparse
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
