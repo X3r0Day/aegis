@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Laya Playground — System 1 decisions</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%231b1814'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='19' fill='%23f2f0e9' text-anchor='middle'%3EL%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wordmark">
+    <span class="mark" aria-hidden="true">L</span>
+    <div class="wordmark-text">
+      <h1>Laya Playground</h1>
+      <p>system 1 decisions &middot; calibrated probabilities</p>
+    </div>
+  </div>
+
+  <div class="masthead-tools">
+    <div id="status" class="status" aria-live="polite"></div>
+    <div class="ctl">
+      <label class="ctl-label" for="model-select">model</label>
+      <select id="model-select"></select>
+    </div>
+    <button id="run" class="btn primary" title="Run inference — Ctrl/Cmd+Enter">
+      <span class="run-label">run</span><span class="key" aria-hidden="true">&#8984;&#9166;</span>
+    </button>
+  </div>
+</header>
+
+<main class="sheet">
+
+  <!-- ------------------------------------------------------------- input -->
+  <section class="col col-input">
+    <div class="col-head">
+      <span class="col-title">Input</span>
+      <div class="col-actions">
+        <button id="scenario-reset" class="link" title="Re-apply the selected scenario preset">reset preset</button>
+      </div>
+    </div>
+
+    <div class="scenario">
+      <select id="scenario-select" title="Load a preset scenario"></select>
+      <p id="scenario-desc" class="scenario-desc"></p>
+    </div>
+
+    <div class="tabs" role="tablist" aria-label="Input sections">
+      <button id="tab-state" class="tab" role="tab" aria-selected="true">State</button>
+      <button id="tab-questions" class="tab" role="tab" aria-selected="false">
+        Questions <span id="q-count" class="count">0</span>
+      </button>
+      <div class="tab-actions">
+        <button id="state-format" class="link" title="Pretty-print the JSON">reformat</button>
+        <button id="add-question" class="link hidden" title="Add a question">+ add</button>
+        <button id="questions-json-toggle" class="link hidden" title="Switch between visual and JSON editing">json</button>
+      </div>
+    </div>
+
+    <div class="panels">
+      <div id="panel-state" class="panel-view active">
+        <div class="editor">
+          <textarea id="state-json" spellcheck="false" autocomplete="off"
+                    placeholder='{ "prompt": "…" } — any JSON value, or plain text'></textarea>
+          <span id="state-validity" class="validity" title="How the state will be sent"></span>
+        </div>
+      </div>
+      <div id="panel-questions" class="panel-view">
+        <div id="questions-builder" class="builder"></div>
+        <textarea id="questions-json" spellcheck="false" autocomplete="off" class="hidden"
+                  placeholder="questions as JSON"></textarea>
+      </div>
+    </div>
+  </section>
+
+  <!-- ---------------------------------------------------------- findings -->
+  <section class="col col-findings">
+    <div class="col-head">
+      <span class="col-title">Findings</span>
+      <div class="col-actions">
+        <button id="copy-json" class="link" title="Copy the raw JSON response">copy json</button>
+        <label class="check" title="Show the raw JSON response">
+          <input type="checkbox" id="raw-toggle"><span>raw</span>
+        </label>
+      </div>
+    </div>
+
+    <p id="result-meta" class="result-meta"></p>
+
+    <div id="results" class="results">
+      <div class="empty">
+        <p class="empty-title">No findings yet.</p>
+        <p class="empty-note">pick a scenario on the left, or write your own state and questions &mdash; then press run.</p>
+      </div>
+    </div>
+    <pre id="raw-json" class="raw hidden"></pre>
+  </section>
+
+</main>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
