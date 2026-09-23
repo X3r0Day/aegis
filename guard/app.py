@@ -1,0 +1,1058 @@
+#!/usr/bin/env python3
+"""Laya Guard — a prompt-injection firewall in front of DeepSeek, with a chat UI.
+
+The middleware owns the upstream key and drops requests the guard classifies
+as prompt injection before they ever reach the model. The bundled chat page is
+just another client of the same OpenAI-compatible endpoint.
+
+    export DEEPSEEK_API_KEY=sk-...
+    .venv/bin/python guard/app.py          # http://127.0.0.1:8978
+
+Environment:
+    GUARD_MODE           block | monitor                  (default block)
+    GUARD_THRESHOLD      decision threshold               (default 0.8)
+    GUARD_MODEL          auto | english | multilingual    (default auto)
+    GUARD_LOG            decision log path                (default guard/logs/decisions.jsonl)
+    GUARD_EXCERPT_CHARS  input chars to store in the log  (default 0 = none)
+    UPSTREAM_BASE        default https://api.deepseek.com
+    UPSTREAM_MODEL       default deepseek-chat
+    UPSTREAM_KEY_ENV     env var holding the key          (default DEEPSEEK_API_KEY)
+"""
+from __future__ import annotations
+
+import asyncio
+import copy
+import hashlib
+import json
+import os
+import random
+import sys
+import threading
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
+
+HERE = Path(__file__).resolve().parent          # binary/guard
+ROOT = HERE.parent                              # binary/
+# laya_guard/ and tools/ both live next to this file — no path juggling needed
+
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("HF_HOME", str(ROOT / "laya" / "models" / "hf"))
+
+from laya_guard import (  # noqa: E402
+    AbuseConfig,
+    AbuseDetector,
+    DecisionLog,
+    FastGuard,
+    GuardConfig,
+    LayaGuard,
+    Verdict,
+    extract_scan_text,
+    model_registry,
+    rule_decision,
+)
+
+from tools import abuse_demo  # noqa: E402  — synthetic traffic profiles for the scenario bench
+
+# --------------------------------------------------------------------- config
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name, default)
+
+
+MODE = _env("GUARD_MODE", "block")
+THRESHOLD = float(_env("GUARD_THRESHOLD", "0.8"))
+GUARD_MODEL = _env("GUARD_MODEL", "english")             # English only for now
+UPSTREAM_BASE = _env("UPSTREAM_BASE", "https://api.deepseek.com").rstrip("/")
+UPSTREAM_MODEL = _env("UPSTREAM_MODEL", "deepseek-chat")
+UPSTREAM_KEY_ENV = _env("UPSTREAM_KEY_ENV", "DEEPSEEK_API_KEY")
+LOG_PATH = Path(_env("GUARD_LOG", str(HERE / "logs" / "decisions.jsonl")))
+EXCERPT_CHARS = int(_env("GUARD_EXCERPT_CHARS", "0"))
+
+ABUSE_MODE = _env("ABUSE_MODE", "monitor")
+ABUSE_THRESHOLD = float(_env("ABUSE_THRESHOLD", "0.45"))
+ABUSE_COOLDOWN = float(_env("ABUSE_COOLDOWN", "60"))
+ABUSE_MODEL = _env("ABUSE_MODEL", "typed-decisions")
+ABUSE_LOG = Path(_env("ABUSE_LOG", str(HERE / "logs" / "abuse.jsonl")))
+ABUSE_ENFORCE = _env("ABUSE_ENFORCE", "1").lower() not in ("0", "false", "no")
+ABUSE_BLOCK_TTL = float(_env("ABUSE_BLOCK_TTL", "60"))
+ABUSE_ENFORCE_INTERVAL = float(_env("ABUSE_ENFORCE_INTERVAL", "5"))
+GUARD_FASTPATH = _env("GUARD_FASTPATH", "0").lower() not in ("0", "false", "no")
+GUARD_FASTPATH_THRESHOLD = float(_env("GUARD_FASTPATH_THRESHOLD", "0.9"))
+
+CHAT_HTML = HERE / "webui" / "chat.html"
+ABUSE_HTML = HERE / "webui" / "abuse.html"
+STATIC_DIR = HERE / "webui" / "static"
+
+guard = LayaGuard(
+    GuardConfig(
+        model=GUARD_MODEL,
+        threshold=THRESHOLD,
+        mode=MODE,
+        excerpt_chars=EXCERPT_CHARS,
+    )
+)
+log = DecisionLog(LOG_PATH)
+
+abuse = AbuseDetector(
+    AbuseConfig(
+        model=ABUSE_MODEL,
+        threshold=ABUSE_THRESHOLD,
+        mode=ABUSE_MODE,
+        cooldown_s=ABUSE_COOLDOWN,
+    )
+)
+abuse_log = DecisionLog(ABUSE_LOG)
+
+_fast_guard: Optional[FastGuard] = None
+_fast_guard_lock = threading.Lock()
+
+
+def get_fast_guard() -> Optional[FastGuard]:
+    """The distilled sub-millisecond student, when enabled and trained."""
+    global _fast_guard
+    if not GUARD_FASTPATH or not FastGuard.available():
+        return None
+    with _fast_guard_lock:
+        if _fast_guard is None:
+            _fast_guard = FastGuard(threshold=GUARD_FASTPATH_THRESHOLD)
+            print("[guard] fast path loaded (threshold %.2f)" % GUARD_FASTPATH_THRESHOLD, flush=True)
+    return _fast_guard
+
+
+def upstream_key() -> str:
+    return os.environ.get(UPSTREAM_KEY_ENV, "")
+
+
+def _compact_verdict(verdict) -> str:
+    compact = {
+        "label": verdict.label,
+        "decision": verdict.decision,
+        "mode": verdict.mode,
+        "threshold": verdict.threshold,
+        "model": verdict.model,
+        "latency_ms": verdict.latency_ms,
+        "probabilities": verdict.probabilities,
+        "triggers": verdict.triggers,
+    }
+    return json.dumps(compact, separators=(",", ":"), ensure_ascii=True)
+
+
+def _warm_all() -> None:
+    guard.warm()
+    abuse.warm()
+    try:
+        get_fast_guard()
+    except Exception as exc:  # noqa: BLE001
+        print("[guard] fast path unavailable: %r" % exc, flush=True)
+
+
+async def _enforcement_loop() -> None:
+    """Every few seconds: evaluate triggered clients and block the abusive ones.
+
+    This is the overseer acting on Laya's verdict — until this existed, the
+    detector only observed. Blocks expire after ABUSE_BLOCK_TTL seconds.
+    """
+    while True:
+        await asyncio.sleep(ABUSE_ENFORCE_INTERVAL)
+        if not ABUSE_ENFORCE:
+            continue
+        try:
+            verdicts = await run_in_threadpool(abuse.evaluate_triggered, "block")
+        except Exception as exc:  # noqa: BLE001
+            print("[guard] enforcement loop error: %r" % exc, flush=True)
+            continue
+        for verdict in verdicts:
+            abuse_log.append(verdict, meta={"endpoint": "demo-api/enforce", "client": verdict.client})
+            if verdict.enforced:
+                abuse.block_client(verdict.client, ABUSE_BLOCK_TTL,
+                                   category=verdict.category, score=verdict.abuse_score)
+                print("[guard] blocked %s for %.0fs — %s (score %.3f)"
+                      % (verdict.client, ABUSE_BLOCK_TTL, verdict.category, verdict.abuse_score), flush=True)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    threading.Thread(target=_warm_all, daemon=True).start()
+    task = asyncio.create_task(_enforcement_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+
+
+app = FastAPI(title="Laya Guard", version="0.1.0", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------- pages
+@app.get("/")
+def index():
+    return RedirectResponse(url="/chat", status_code=307)
+
+
+@app.get("/chat")
+def chat_page():
+    return FileResponse(CHAT_HTML)
+
+
+@app.get("/api-abuse")
+def abuse_page():
+    return FileResponse(ABUSE_HTML)
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+# ----------------------------------------------------------------------- api
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "key_env": UPSTREAM_KEY_ENV,
+        "key_set": bool(upstream_key()),
+        "upstream": UPSTREAM_BASE,
+        "upstream_model": UPSTREAM_MODEL,
+        "mode": MODE,
+        "threshold": THRESHOLD,
+        "model": GUARD_MODEL,
+        "loaded": guard.loaded_models,
+        "device": "cuda" if _cuda() else "cpu",
+        "abuse": {
+            "mode": ABUSE_MODE,
+            "threshold": ABUSE_THRESHOLD,
+            "model": ABUSE_MODEL,
+            "cooldown_s": ABUSE_COOLDOWN,
+            "enforce": ABUSE_ENFORCE,
+            "block_ttl_s": ABUSE_BLOCK_TTL,
+            "enforce_interval_s": ABUSE_ENFORCE_INTERVAL,
+        },
+        "blocked_clients": abuse.blocked_clients(),
+        "fastpath": {
+            "enabled": GUARD_FASTPATH,
+            "artifact": FastGuard.available(),
+            "loaded": _fast_guard is not None,
+            "threshold": GUARD_FASTPATH_THRESHOLD,
+            "metrics": (_fast_guard.metrics if _fast_guard is not None else None),
+        },
+        "demo_api": {"rate_limit_per_s": _DEMO_RATE_LIMIT},
+    }
+
+
+@app.get("/api/models")
+def api_models():
+    """The Laya checkpoints this deployment knows about (runnable or not)."""
+    return {
+        "models": [entry.to_dict() for entry in model_registry()],
+        "guard_default": GUARD_MODEL,
+        "abuse_default": ABUSE_MODEL,
+    }
+
+
+def _cuda() -> bool:
+    try:
+        import torch
+
+        return torch.cuda.is_available()
+    except Exception:
+        return False
+
+
+@app.get("/api/decisions")
+def decisions(limit: int = 60):
+    return {"decisions": log.tail(limit)}
+
+
+@app.post("/v1/guard/check")
+async def guard_check(request: Request):
+    """Evaluate a request without forwarding it (used by tooling and demos)."""
+    try:
+        payload = await request.json()
+    except Exception:
+        body = (await request.body()).decode("utf-8", "replace")
+        payload = {"input": body}
+    mode = _request_mode(request)
+    verdict = await run_in_threadpool(guard.check_request, payload, mode=mode)
+    log.append(verdict, meta={"endpoint": "guard/check"})
+    return verdict.to_dict()
+
+
+def _request_mode(request: Request) -> str:
+    header = (request.headers.get("x-guard-mode") or "").lower()
+    return header if header in ("block", "monitor") else MODE
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "request body must be JSON"}})
+
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"message": "'messages' must be a non-empty list", "type": "invalid_request_error"}},
+        )
+
+    mode = _request_mode(request)
+
+    fast = get_fast_guard()
+    if fast is not None and mode == "block":
+        text, scope = extract_scan_text(messages, guard.cfg.scope)
+        fast_result = fast.score(text)
+        # a rule-allow (e.g. a greeting) must not be overridden by the student
+        rule = rule_decision(text) or ""
+        if fast_result.probability >= GUARD_FASTPATH_THRESHOLD and not rule.startswith("allow"):
+            fast_verdict = Verdict(
+                decision="block",
+                blocked=True,
+                enforced=True,
+                mode=mode,
+                threshold=GUARD_FASTPATH_THRESHOLD,
+                thresholds={"fastpath": GUARD_FASTPATH_THRESHOLD},
+                probabilities={"fastpath_block": fast_result.probability},
+                triggers=[{"question": "fastpath_block", "probability": fast_result.probability,
+                           "threshold": GUARD_FASTPATH_THRESHOLD}],
+                confidences={},
+                model=fast_result.model,
+                routing={"model": fast_result.model, "reason": "distilled student (sub-ms fast path)",
+                         "repo": None, "detection": None, "workflow": None},
+                latency_ms=round(fast_result.latency_us / 1000.0, 3),
+                text_sha256=hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest(),
+                scope=scope,
+            )
+            log.append(fast_verdict, meta={"endpoint": "chat/completions", "fastpath": True,
+                                           "model": fast_result.model})
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": {"message": "Blocked by Laya Guard (fast path): prompt injection",
+                              "type": "prompt_injection_blocked", "code": "guard_blocked"},
+                    "guard": fast_verdict.to_dict(),
+                },
+                headers={"X-Guard-Verdict": _compact_verdict(fast_verdict), "X-Guard-Fastpath": "1"},
+            )
+
+    verdict = await run_in_threadpool(guard.check_messages, messages, mode=mode)
+    log.append(verdict, meta={"endpoint": "chat/completions", "model": payload.get("model") or UPSTREAM_MODEL})
+
+    if verdict.enforced:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "error": {
+                    "message": "Blocked by Laya Guard: prompt injection",
+                    "type": "prompt_injection_blocked",
+                    "code": "guard_blocked",
+                },
+                "guard": verdict.to_dict(),
+            },
+            headers={"X-Guard-Verdict": _compact_verdict(verdict)},
+        )
+
+    key = upstream_key()
+    if not key:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {
+                    "message": "%s is not set on the guard server" % UPSTREAM_KEY_ENV,
+                    "type": "upstream_key_missing",
+                },
+                "guard": verdict.to_dict(),
+            },
+            headers={"X-Guard-Verdict": _compact_verdict(verdict)},
+        )
+
+    forward = dict(payload)
+    forward["model"] = forward.get("model") or UPSTREAM_MODEL
+    forward.pop("guard_mode", None)
+
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
+            upstream = await client.post(
+                UPSTREAM_BASE + "/chat/completions",
+                json=forward,
+                headers={"Authorization": "Bearer %s" % key},
+            )
+    except httpx.HTTPError as exc:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": {"message": "upstream request failed: %s" % exc, "type": "upstream_error"},
+                "guard": verdict.to_dict(),
+            },
+            headers={"X-Guard-Verdict": _compact_verdict(verdict)},
+        )
+
+    headers = {
+        "X-Guard-Verdict": _compact_verdict(verdict),
+        "X-Upstream-Ms": "%.0f" % ((time.perf_counter() - started) * 1000.0),
+    }
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type", "application/json"),
+        headers=headers,
+    )
+
+
+# ---------------------------------------------------------------------- abuse
+def _abuse_mode(request: Request) -> str:
+    header = (request.headers.get("x-abuse-mode") or "").lower()
+    return header if header in ("block", "monitor") else ABUSE_MODE
+
+
+def _events_from_body(body: Any) -> list:
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        for key in ("events", "requests", "logs"):
+            if isinstance(body.get(key), list):
+                return body[key]
+    raise ValueError("body must be a JSON list of events or an object with an 'events' list")
+
+
+@app.post("/v1/abuse/events")
+async def abuse_events(request: Request):
+    """Ingest request telemetry; triggered clients are evaluated (cooldown-gated)."""
+    try:
+        payload = await request.json()
+        events = _events_from_body(payload)
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"error": {"message": str(exc), "type": "invalid_request_error"}})
+
+    accepted = len(events)
+    try:
+        await run_in_threadpool(abuse.observe, events)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=422, content={"error": {"message": "invalid event: %s" % exc, "type": "invalid_request_error"}})
+
+    mode = _abuse_mode(request)
+    verdicts = await run_in_threadpool(abuse.evaluate_triggered, mode)
+    for verdict in verdicts:
+        abuse_log.append(verdict, meta={"endpoint": "abuse/events", "client": verdict.client})
+    return {"accepted": accepted, "evaluations": [v.to_dict() for v in verdicts]}
+
+
+@app.get("/v1/abuse/clients")
+def abuse_clients(top: int = 20):
+    return {"clients": abuse.clients(top)}
+
+
+@app.post("/v1/abuse/check")
+async def abuse_check(request: Request):
+    """Evaluate supplied events (request-file path) or one live client."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+
+    mode = _abuse_mode(request)
+    if isinstance(payload, dict) and payload.get("client"):
+        key = str(payload["client"])
+        try:
+            verdict = await run_in_threadpool(abuse.evaluate, key, force=True, mode=mode)
+        except KeyError as exc:
+            return JSONResponse(status_code=404, content={"error": {"message": str(exc)}})
+        if verdict is None:
+            return JSONResponse(status_code=404, content={"error": {"message": "client %r has no traffic" % key}})
+        abuse_log.append(verdict, meta={"endpoint": "abuse/check", "client": key})
+        return {"verdicts": [verdict.to_dict()]}
+
+    try:
+        events = _events_from_body(payload)
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"error": {"message": str(exc), "type": "invalid_request_error"}})
+    verdicts = await run_in_threadpool(abuse.check_events, events, mode)
+    for verdict in verdicts:
+        abuse_log.append(verdict, meta={"endpoint": "abuse/check", "client": verdict.client})
+    return {"verdicts": [v.to_dict() for v in verdicts]}
+
+
+@app.get("/api/abuse/decisions")
+def abuse_decisions(limit: int = 60):
+    return {"decisions": abuse_log.tail(limit)}
+
+
+# ------------------------------------------------------------------ demo API
+# A small but real HTTP API the bench sends actual requests to. It stands in
+# for the customer's API behind the guard: every request is recorded as
+# telemetry, and clients Laya has flagged are rejected with 429 while blocked.
+_DEMO_RATE: Dict[str, list] = {}
+_DEMO_INFLIGHT: Dict[str, int] = {}
+# Rule-based protection of the demo API itself (separate from Laya blocks).
+# 0 disables it, so the only thing stopping a flood is Laya's verdict.
+_DEMO_RATE_LIMIT = float(_env("DEMO_RATE_LIMIT", "60"))
+
+
+def _demo_client(request: Request) -> str:
+    forwarded = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    return request.client.host if request.client else "?"
+
+
+def _demo_rate_limited(client: str) -> bool:
+    if _DEMO_RATE_LIMIT <= 0:
+        return False
+    now = time.time()
+    bucket = _DEMO_RATE.get(client)
+    if bucket is None or now - bucket[0] >= 1.0:
+        _DEMO_RATE[client] = [now, 1]
+        return False
+    bucket[1] += 1
+    return bucket[1] > _DEMO_RATE_LIMIT
+
+
+def _demo_decr_inflight(client: str) -> None:
+    _DEMO_INFLIGHT[client] = max(0, _DEMO_INFLIGHT.get(client, 1) - 1)
+
+
+@app.middleware("http")
+async def demo_api_middleware(request: Request, call_next):
+    path = request.url.path
+    if path != "/demo-api" and not path.startswith("/demo-api/"):
+        return await call_next(request)
+
+    client = _demo_client(request)
+    started = time.time()
+    user_agent = request.headers.get("user-agent")
+    inflight = _DEMO_INFLIGHT.get(client, 0) + 1
+    _DEMO_INFLIGHT[client] = inflight
+
+    def record(status: int, size: int) -> None:
+        try:
+            abuse.observe([{
+                "ts": started,
+                "method": request.method,
+                "path": path,
+                "status": status,
+                "latency_ms": round((time.time() - started) * 1000, 2),
+                "bytes_out": size,
+                "ip": client,
+                "user_agent": user_agent,
+                "in_flight": inflight,
+            }])
+        except Exception:
+            pass
+
+    if ABUSE_ENFORCE:
+        block = abuse.block_state(client)
+        if block:
+            record(429, 0)
+            _demo_decr_inflight(client)
+            return JSONResponse(status_code=429, content={
+                "detail": "blocked by Laya Guard — %s (retry in %ss)"
+                          % (block.get("category") or "abuse", int(block["remaining_s"])),
+                "guard": {"client": client, **block},
+            })
+
+    if _demo_rate_limited(client):
+        record(429, 0)
+        _demo_decr_inflight(client)
+        return JSONResponse(status_code=429, content={"detail": "rate limit exceeded (demo API rule)"})
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        record(500, 0)
+        _demo_decr_inflight(client)
+        raise
+    size = int(response.headers.get("content-length") or 0)
+    record(response.status_code, size)
+    _demo_decr_inflight(client)
+    return response
+
+
+@app.get("/demo-api")
+@app.get("/demo-api/")
+def demo_index():
+    return {
+        "service": "demo API — the stand-in for the customer's API behind Laya Guard",
+        "endpoints": [
+            "GET  /demo-api/v1/products",
+            "GET  /demo-api/v1/products/{id}   (1–500)",
+            "GET  /demo-api/v1/orders",
+            "GET  /demo-api/v1/orders/{id}     (1–2000)",
+            "GET  /demo-api/v1/me",
+            "GET  /demo-api/v1/cart",
+            "GET  /demo-api/v1/search?q=",
+            "GET  /demo-api/v1/jobs/status",
+            "GET  /demo-api/v1/users/{id}      (1–4900)",
+            "POST /demo-api/v1/auth/login      (username ending 00 + password 'correct')",
+        ],
+        "notes": "every request is recorded as telemetry; Laya Guard blocks abusive clients with 429",
+    }
+
+
+@app.get("/demo-api/v1/products")
+def demo_products(request: Request):
+    return {"items": [{"id": i, "name": "Product %d" % i} for i in range(1, 6)]}
+
+
+@app.get("/demo-api/v1/products/{product_id}")
+def demo_product(product_id: int, request: Request):
+    if 1 <= product_id <= 500:
+        return {"id": product_id, "name": "Product %d" % product_id, "stock": 12}
+    raise HTTPException(status_code=404, detail="product not found")
+
+
+@app.get("/demo-api/v1/orders")
+def demo_orders(request: Request):
+    return {"items": [{"id": 1042, "status": "open"}]}
+
+
+@app.get("/demo-api/v1/orders/{order_id}")
+def demo_order(order_id: int, request: Request):
+    if 1 <= order_id <= 2000:
+        return {"id": order_id, "status": "open", "total": 42.5}
+    raise HTTPException(status_code=404, detail="order not found")
+
+
+@app.get("/demo-api/v1/me")
+def demo_me(request: Request):
+    return {"user": "demo", "plan": "pro"}
+
+
+@app.get("/demo-api/v1/cart")
+def demo_cart(request: Request):
+    return {"items": [], "total": 0.0}
+
+
+@app.get("/demo-api/v1/search")
+def demo_search(request: Request, q: str = ""):
+    return {"query": q, "results": [{"id": 1, "name": "Result for %s" % (q or "demo")}]}
+
+
+@app.get("/demo-api/v1/jobs/status")
+def demo_job_status(request: Request):
+    return {"status": "ok", "queue_depth": 3, "last_run": "2026-09-23T18:00:00"}
+
+
+@app.get("/demo-api/v1/users/{user_id}")
+def demo_user(user_id: int, request: Request):
+    if 1 <= user_id <= 4900:
+        return {"id": user_id, "name": "User %d" % user_id, "email": "user%d@corp.example" % user_id}
+    raise HTTPException(status_code=404, detail="user not found")
+
+
+@app.post("/demo-api/v1/auth/login")
+async def demo_login(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    username = str(body.get("username") or "")
+    password = str(body.get("password") or "")
+    if username.endswith("00") and password == "correct":
+        return {"token": "demo-token", "user": username}
+    raise HTTPException(status_code=401, detail="invalid credentials")
+
+
+# ------------------------------------------------------------- live scenarios
+def _base_plan(**overrides: Any) -> Dict[str, Any]:
+    plan: Dict[str, Any] = {
+        "target": "",  # filled with this server's /demo-api at request time
+        "method": "GET",
+        "pick": "cycle",
+        "paths": ["/v1/me"],
+        "count": 20,
+        "rate_per_s": 5,
+        "concurrency": 4,
+        "client_ip": "127.0.0.1",
+        "user_agent": "demo-client/1.0",
+        "headers": {},
+    }
+    plan.update(overrides)
+    return plan
+
+
+LIVE_PLANS: Dict[str, Dict[str, Any]] = {
+    "normal_browse": _base_plan(
+        client_ip="198.51.100.10",
+        user_agent="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        asn="3320", country="DE", datacenter=False,
+        paths=["/v1/products", "/v1/search?q=shoes", "/v1/me", "/v1/cart", "/v1/orders/{id}"],
+        count=18, rate_per_s=2.5, jitter=0.7, id_start=1995, concurrency=2,
+    ),
+    "integration_poll": _base_plan(
+        client_ip="198.51.100.20",
+        user_agent="acme-integration-bot/2.4 (system-monitor)",
+        asn="64513", country="IE", datacenter=True,
+        api_key_id="key_integration",
+        client_age_s=2592000, prior_requests_24h=172800, prior_error_rate=0.001,
+        paths=["/v1/jobs/status"], count=60, rate_per_s=10, concurrency=2,
+    ),
+    "scraper": _base_plan(
+        client_ip="203.0.113.9",
+        user_agent="python-requests/2.32.3",
+        asn="24940", country="DE", datacenter=True,
+        # long enough that the enforcement loop cuts it off mid-run
+        paths=["/v1/users/{id}"], count=300, rate_per_s=15, id_start=4800, id_step=1, concurrency=8,
+    ),
+    "credential_stuffing": _base_plan(
+        client_ip="203.0.113.44",
+        user_agent="python-requests/2.31.0",
+        asn="9009", country="NL", datacenter=True,
+        method="POST", paths=["/v1/auth/login"], auth=True, count=120, rate_per_s=20, concurrency=4,
+    ),
+    "burst_dos": _base_plan(
+        client_ip="203.0.113.77",
+        user_agent="curl/8.6.0",
+        asn="14061", country="US", datacenter=True,
+        paths=["/v1/search?q=load"], count=250, rate_per_s=100, concurrency=30,
+    ),
+    "parameter_fuzzing": _base_plan(
+        client_ip="203.0.113.100",
+        user_agent="sqlmap/1.8",
+        asn="16276", country="FR", datacenter=True,
+        pick="random",
+        paths=["/v1/admin/config", "/v1/backup.sql", "/v1/debug", "/v1/internal/users",
+               "/wp-admin", "/v1/users/999999", "/v1/gql", "/v1/actuator/env", "/v1/../../etc/passwd"],
+        count=80, rate_per_s=15, concurrency=6,
+    ),
+}
+
+
+def _plan_for(profile_id: str, request: Request) -> Dict[str, Any]:
+    plan = copy.deepcopy(LIVE_PLANS[profile_id])
+    if not plan.get("target"):
+        plan["target"] = str(request.base_url).rstrip("/") + "/demo-api"
+    return plan
+
+
+async def _execute_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Send the plan's HTTP requests for real and capture their telemetry."""
+    target = str(plan.get("target") or "").rstrip("/")
+    if not target.startswith(("http://", "https://")):
+        raise ValueError("target must be an http(s) URL")
+    count = max(1, min(int(plan.get("count") or 1), 2000))
+    rate = max(0.1, min(float(plan.get("rate_per_s") or 1), 500.0))
+    concurrency = max(1, min(int(plan.get("concurrency") or 8), 64))
+    jitter = max(0.0, min(float(plan.get("jitter") or 0.0), 1.0))
+    interval = 1.0 / rate
+    method = str(plan.get("method") or "GET").upper()
+    pick = str(plan.get("pick") or "cycle")
+    paths = plan.get("paths")
+    if not isinstance(paths, list) or not paths:
+        raise ValueError("paths must be a non-empty list")
+    id_start = int(plan.get("id_start") or 1)
+    id_step = int(plan.get("id_step") or 1)
+    auth = bool(plan.get("auth"))
+    client_ip = str(plan.get("client_ip") or "127.0.0.1")
+    user_agent = str(plan.get("user_agent") or "demo-client/1.0")
+    extra_headers = {str(k): str(v) for k, v in (plan.get("headers") or {}).items()}
+    context = {key: plan[key] for key in
+               ("asn", "country", "datacenter", "api_key_id", "client_age_s",
+                "prior_requests_24h", "prior_error_rate") if key in plan}
+
+    headers = {"User-Agent": user_agent, "X-Forwarded-For": client_ip, **extra_headers}
+    rng = random.Random(7)
+    semaphore = asyncio.Semaphore(concurrency)
+    events: List[Dict[str, Any]] = []
+    statuses: Dict[str, int] = {}
+    errors = 0
+
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+        async def fire(index: int, path: str) -> None:
+            nonlocal errors
+            async with semaphore:
+                started = time.time()
+                body = None
+                if auth:
+                    body = {"username": "user%04d" % index, "password": "guess-%d" % index}
+                status, size = 0, 0
+                guard_blocked = False
+                try:
+                    response = await client.request(method, target + path, headers=headers, json=body)
+                    status = response.status_code
+                    size = len(response.content)
+                    if status == 429 and "Laya Guard" in response.text[:400]:
+                        guard_blocked = True
+                except httpx.HTTPError:
+                    errors += 1
+                latency = (time.time() - started) * 1000.0
+                if status:
+                    key = "429_laya" if guard_blocked else str(status)
+                    statuses[key] = statuses.get(key, 0) + 1
+                event: Dict[str, Any] = {
+                    "ts": started,
+                    "method": method,
+                    "path": path,
+                    "status": status,
+                    "latency_ms": round(latency, 2),
+                    "bytes_out": size,
+                    "ip": client_ip,
+                    "user_agent": user_agent,
+                    **context,
+                }
+                if auth:
+                    event["username"] = "user%04d" % index
+                events.append(event)
+
+        start = time.time()
+        tasks = []
+        for i in range(count):
+            due = start + i * interval
+            if jitter:
+                due += rng.uniform(-jitter, jitter) * interval
+            delay = due - time.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            template = str(paths[i % len(paths)] if pick != "random" else rng.choice(paths))
+            path = template.replace("{id}", str(id_start + i * id_step))
+            tasks.append(asyncio.create_task(fire(i, path)))
+        if tasks:
+            await asyncio.gather(*tasks)
+        duration = time.time() - start
+
+    return {"events": events, "duration_s": round(duration, 2), "statuses": statuses, "errors": errors}
+
+
+# --------------------------------------------------------------- scenario bench
+ABUSE_PROFILES = [
+    {
+        "id": "normal_browse",
+        "name": "Normal user browsing",
+        "expect": "allow",
+        "description": "Varied endpoints at a human pace, browser user agent, residential IP.",
+    },
+    {
+        "id": "integration_poll",
+        "name": "Legit integration poller",
+        "expect": "allow",
+        "description": "A known keyed client polls one endpoint steadily — automated but legitimate.",
+    },
+    {
+        "id": "scraper",
+        "name": "Scraper / enumeration",
+        "expect": "block",
+        "description": "Sequential user IDs walked at speed, a third returning 404.",
+    },
+    {
+        "id": "credential_stuffing",
+        "name": "Credential stuffing",
+        "expect": "block",
+        "description": "Login attempts at speed, almost all rejected, a different username each time.",
+    },
+    {
+        "id": "burst_dos",
+        "name": "Burst / rate abuse",
+        "expect": "block",
+        "description": "A flood of requests in seconds, far above the API rate limit.",
+    },
+    {
+        "id": "parameter_fuzzing",
+        "name": "Parameter fuzzer",
+        "expect": "block",
+        "description": "Random and malformed paths, mixed methods, sqlmap user agent.",
+    },
+]
+
+
+@app.get("/api-abuse/profiles")
+def api_abuse_profiles():
+    return {"profiles": ABUSE_PROFILES, "default_mode": "block", "model": ABUSE_MODEL}
+
+
+def _capture_sample(events: list, head: int = 50, tail: int = 70) -> list:
+    """A readable slice of a run: the early behaviour plus how it ended."""
+    if len(events) <= head + tail:
+        return events
+    return events[:head] + events[-tail:]
+
+
+def _event_stats(events: list) -> Dict[str, Any]:
+    if not events:
+        return {"count": 0}
+    clients, endpoints, stamps = {}, {}, []
+    for event in events:
+        key = event.get("api_key_id") or event.get("ip") or "?"
+        clients[key] = clients.get(key, 0) + 1
+        endpoint = event.get("route") or event.get("path") or "?"
+        endpoints[endpoint] = endpoints.get(endpoint, 0) + 1
+        try:
+            stamps.append(float(event.get("ts", 0)))
+        except (TypeError, ValueError):
+            pass
+    top_endpoint = max(endpoints.items(), key=lambda kv: kv[1]) if endpoints else ("?", 0)
+    span = (max(stamps) - min(stamps)) if stamps else 0.0
+    return {
+        "count": len(events),
+        "clients": sorted(clients)[:3],
+        "span_s": round(span, 1),
+        "top_endpoint": top_endpoint[0],
+        "top_endpoint_share": round(top_endpoint[1] / len(events), 3),
+    }
+
+
+def _generate_profile(profile_id: str, seed: int) -> list:
+    rng = random.Random(seed)
+    now = time.time()
+    return abuse_demo.PROFILES[profile_id](now, rng)
+
+
+@app.post("/api-abuse/preview")
+async def api_abuse_preview(request: Request):
+    """Return the exact telemetry payload a scenario would send (editable in the UI)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+    profile_id = body.get("profile")
+    if profile_id not in abuse_demo.PROFILES:
+        return JSONResponse(status_code=422, content={"error": {"message": "unknown profile %r" % profile_id}})
+    seed = int(body.get("seed") or 7)
+    events = _generate_profile(profile_id, seed)
+    return {
+        "profile": profile_id,
+        "seed": seed,
+        "events": events,
+        "stats": _event_stats(events),
+        "plan": _plan_for(profile_id, request),
+    }
+
+
+@app.post("/api-abuse/simulate")
+async def api_abuse_simulate(request: Request):
+    """Run the abuse detector on a scenario's payload, or on an edited payload.
+
+    Body: {profile?, events?, mode?, seed?} — when `events` is present it is
+    evaluated verbatim (same schema as /v1/abuse/events); otherwise the
+    profile is generated server-side.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+
+    mode = str(body.get("mode") or "block").lower()
+    if mode not in ("block", "monitor"):
+        mode = "block"
+
+    if isinstance(body.get("events"), list):
+        events = body["events"]
+        if not events:
+            return JSONResponse(status_code=422, content={"error": {"message": "events list is empty"}})
+        if len(events) > 50000:
+            return JSONResponse(status_code=422, content={"error": {"message": "too many events (max 50000)"}})
+        if not all(isinstance(event, dict) for event in events):
+            return JSONResponse(status_code=422, content={"error": {"message": "every event must be a JSON object"}})
+        profile_id = str(body.get("profile") or "custom")
+    else:
+        profile_id = body.get("profile")
+        if profile_id not in abuse_demo.PROFILES:
+            return JSONResponse(status_code=422, content={"error": {"message": "unknown profile %r" % profile_id}})
+        seed = int(body.get("seed") or 7)
+        events = _generate_profile(profile_id, seed)
+
+    started = time.perf_counter()
+    try:
+        verdicts = await run_in_threadpool(abuse.check_events, events, mode)
+    except (ValueError, TypeError) as exc:
+        return JSONResponse(status_code=422, content={"error": {"message": "invalid event payload: %s" % exc}})
+    elapsed = (time.perf_counter() - started) * 1000.0
+    for verdict in verdicts:
+        abuse_log.append(verdict, meta={"endpoint": "api-abuse/simulate", "profile": profile_id})
+
+    return {
+        "profile": profile_id,
+        "mode": mode,
+        "events": len(events),
+        "elapsed_ms": round(elapsed, 1),
+        "verdict": verdicts[0].to_dict() if verdicts else None,
+    }
+
+
+@app.post("/api-abuse/live")
+async def api_abuse_live(request: Request):
+    """Send a scenario's HTTP requests for real, then score the captured telemetry."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+
+    profile_id = str(body.get("profile") or "")
+    plan = body.get("plan")
+    if plan is None:
+        if profile_id not in LIVE_PLANS:
+            return JSONResponse(status_code=422, content={"error": {"message": "unknown profile %r" % profile_id}})
+        plan = _plan_for(profile_id, request)
+    elif not isinstance(plan, dict):
+        return JSONResponse(status_code=422, content={"error": {"message": "plan must be a JSON object"}})
+    if not profile_id:
+        profile_id = "custom"
+
+    mode = str(body.get("mode") or "block").lower()
+    if mode not in ("block", "monitor"):
+        mode = "block"
+
+    client = str(plan.get("client_ip") or "").strip()
+    if client:
+        abuse.reset_client(client)  # repeatable bench runs: start this client clean
+
+    try:
+        result = await _execute_plan(plan)
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"error": {"message": str(exc)}})
+    except Exception as exc:  # noqa: BLE001 — report execution failures to the bench
+        return JSONResponse(status_code=502, content={"error": {"message": "execution failed: %s" % exc}})
+
+    verdicts = await run_in_threadpool(abuse.check_events, result["events"], mode)
+    for verdict in verdicts:
+        abuse_log.append(verdict, meta={"endpoint": "api-abuse/live", "profile": profile_id})
+
+    return {
+        "profile": profile_id,
+        "mode": mode,
+        "events": len(result["events"]),
+        "duration_s": result["duration_s"],
+        "statuses": result["statuses"],
+        "errors": result["errors"],
+        "plan": plan,
+        "captured": _capture_sample(result["events"]),
+        "verdict": verdicts[0].to_dict() if verdicts else None,
+    }
+
+
+@app.post("/api-abuse/unblock")
+async def api_abuse_unblock(request: Request):
+    """Lift a Laya block early (demo convenience)."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "body must be JSON"}})
+    client = body.get("client")
+    if not client:
+        return JSONResponse(status_code=422, content={"error": {"message": "client is required"}})
+    return {"client": str(client), "unblocked": abuse.clear_block(str(client))}
+
+
+def main() -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Laya Guard middleware", formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8978)
+    args = ap.parse_args()
+
+    print("[guard] upstream: %s (%s)" % (UPSTREAM_BASE, UPSTREAM_MODEL), flush=True)
+    print("[guard] mode: %s | threshold: %s | model: %s" % (MODE, THRESHOLD, GUARD_MODEL), flush=True)
+    print("[guard] key env: %s (%s)" % (UPSTREAM_KEY_ENV, "set" if upstream_key() else "MISSING"), flush=True)
+    print("[guard] log: %s" % LOG_PATH, flush=True)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

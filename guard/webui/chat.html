@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Laya Guard — chat</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%231b1814'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-size='19' fill='%23f2f0e9' text-anchor='middle'%3EG%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/chat.css">
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wordmark">
+    <span class="mark" aria-hidden="true">G</span>
+    <div class="wordmark-text">
+      <h1>Laya Guard</h1>
+      <p>prompt-injection firewall &middot; chat demo</p>
+    </div>
+  </div>
+  <div class="masthead-tools">
+    <span id="status" class="status" title="server status">connecting…</span>
+    <div class="mode-switch" role="group" aria-label="guard mode">
+      <button id="mode-block" class="mode active" title="Detected injections are dropped">block</button>
+      <button id="mode-monitor" class="mode" title="Detected injections are logged but forwarded">monitor</button>
+    </div>
+    <a class="btn" href="/api-abuse">api abuse</a>
+    <button id="new-chat" class="btn">new chat</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden" role="alert"></div>
+
+<main class="layout">
+  <aside class="rail rail-convs">
+    <div class="rail-head">Conversations</div>
+    <div id="conv-list" class="conv-list"></div>
+  </aside>
+
+  <section class="chat">
+    <div id="thread" class="thread" aria-live="polite"></div>
+    <div class="composer">
+      <textarea id="input" rows="2" placeholder="Ask the model anything… (the guard inspects every message first)"
+                spellcheck="false"></textarea>
+      <div class="composer-right">
+        <button id="send" class="btn primary">send</button>
+        <div class="composer-hint">enter to send &middot; shift+enter newline</div>
+      </div>
+    </div>
+  </section>
+
+  <aside class="rail rail-log">
+    <div class="rail-head">Guard log <span id="log-counts" class="counts"></span></div>
+    <div id="guard-log" class="guard-log"></div>
+  </aside>
+</main>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="/static/chat.js"></script>
+</body>
+</html>
