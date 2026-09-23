@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+.uv-cache/
+
+# model weights + HuggingFace cache (fetch with laya/download_models.py)
+laya/models/
+
+# runtime artifacts
+guard/logs/
+*.log
+*.pid
+
+# browser / tooling artifacts
+.playwright-mcp/
+
+# screenshots
+*.png
+!laya/webapp/playground.png
