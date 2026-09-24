@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Aegis console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23ff9830'/%3E%3Ctext x='16' y='23' font-family='Arial,sans-serif' font-weight='700' font-size='19' fill='%2316181c' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/console.css">
+</head>
+<body class="console">
+
+<header class="topbar">
+  <a class="brand" href="/console" title="Aegis">
+    <span class="brand-mark">A</span>
+    <span class="brand-name">Aegis</span>
+  </a>
+  <div class="topbar-center">
+    <button id="palette-btn" class="search" type="button">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+      <span class="grow">Search or jump to...</span>
+      <kbd>ctrl+k</kbd>
+    </button>
+  </div>
+  <div class="topbar-right" id="top-status"></div>
+</header>
+
+<div class="crumbs">
+  <button id="menu-btn" class="icon-btn" type="button" title="Menu">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+  </button>
+  <nav class="crumbs-path">
+    <span>Home</span><span class="sep">&gt;</span><span id="crumb">Overview</span>
+  </nav>
+  <div class="crumbs-right">
+    <button id="refresh" class="btn ghost" type="button" title="Refresh now">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6"/></svg>
+      refresh
+    </button>
+    <span class="chip time">last 24 hours</span>
+  </div>
+</div>
+
+<div id="menu" class="menu-dropdown hidden"></div>
+
+<main class="page">
+  <section id="view-overview" class="view overview"></section>
+  <section id="view-decisions" class="view hidden"></section>
+  <section id="view-clients" class="view hidden"></section>
+  <section id="view-devices" class="view hidden"></section>
+  <section id="view-agent" class="view hidden"></section>
+  <section id="view-settings" class="view hidden"></section>
+</main>
+
+<div id="palette" class="palette hidden">
+  <div class="palette-box">
+    <input id="palette-input" type="text" placeholder="Search or jump to..." autocomplete="off" spellcheck="false">
+    <div id="palette-list" class="palette-list"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="/static/echarts.min.js"></script>
+<script src="/static/ui.js"></script>
+<script src="/static/dashboard.js"></script>
+<script src="/static/console.js"></script>
+</body>
+</html>

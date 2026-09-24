@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Aegis login</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%23ff9830'/%3E%3Ctext x='16' y='23' font-family='Arial,sans-serif' font-weight='700' font-size='19' fill='%2316181c' text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/console.css">
+</head>
+<body class="gate">
+
+<main class="gate-card">
+  <div class="gate-brand"><span class="mark">A</span><strong>Aegis</strong></div>
+  <h1>Sign in</h1>
+  <p class="gate-note">The console for your prompt-injection and API abuse monitoring.</p>
+
+  <div class="field">
+    <label for="password">password</label>
+    <input id="password" type="password" autocomplete="current-password" autofocus>
+  </div>
+  <button id="go" class="btn primary">sign in</button>
+  <div id="err" class="gate-err" role="alert"></div>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+
+async function login() {
+  const password = $("#password").value;
+  if (!password) return;
+  $("#go").disabled = true;
+  try {
+    const res = await fetch("/console/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    if (res.status === 409) { location.href = "/setup"; return; }
+    if (!res.ok) throw new Error("wrong password");
+    location.href = "/console";
+  } catch (err) {
+    $("#err").textContent = err.message;
+    $("#go").disabled = false;
+  }
+}
+
+$("#go").onclick = login;
+$("#password").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
+</script>
+</body>
+</html>
