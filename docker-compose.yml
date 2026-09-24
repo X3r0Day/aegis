@@ -1,0 +1,19 @@
+services:
+  aegis:
+    build: .
+    image: aegis:latest
+    container_name: aegis
+    ports:
+      - "8978:8978"
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      GUARD_FASTPATH: "1"
+      HF_HOME: /app/laya/models/hf
+    volumes:
+      # existing checkpoints on the host are reused as-is; if the folder is
+      # empty the entrypoint downloads them into it (one time, persistent)
+      - ${AEGIS_MODELS:-./laya/models/laya}:/app/laya/models/laya
+      - ${AEGIS_HF:-./laya/models/hf}:/app/laya/models/hf
+      - ./guard/data:/app/guard/data
+      - ./guard/logs:/app/guard/logs
+    restart: unless-stopped
