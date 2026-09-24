@@ -1,4 +1,4 @@
-/* Laya Guard chat. */
+/* Aegis Guard chat. */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
@@ -212,8 +212,8 @@ function renderMessage(msg) {
     const card = el("div", "block-card");
     const label = verdictLabel(msg.verdict);
     const head = el("div", "head", label === "would-block"
-      ? "⚠ Laya Guard flagged this message (monitor mode, forwarded anyway)"
-      : "⛔ Blocked by Laya Guard: prompt injection");
+      ? "⚠ Aegis Guard flagged this message (monitor mode, forwarded anyway)"
+      : "⛔ Blocked by Aegis Guard: prompt injection");
     card.append(head);
     const trig = (msg.verdict && msg.verdict.triggers || []).map((t) => `${t.question} = ${Number(t.probability).toFixed(2)}`).join(", ");
     if (trig) card.append(el("div", "detail", trig));

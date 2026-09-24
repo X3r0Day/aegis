@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Guard server: prompt-injection firewall + API abuse detector + chat UI.
+"""Aegis: guard server with a web console.
+
+Machine side: OpenAI-compatible proxy, abuse telemetry ingest, check API.
+Human side:  /console, first run goes through /setup, then everything is
+configured and watched in the browser.
 
     export DEEPSEEK_API_KEY=sk-...
-    .venv/bin/python guard/app.py            # http://127.0.0.1:8978
+    .venv/bin/python guard/app.py            # console at http://127.0.0.1:8978
 
 env:
     GUARD_MODE=block|monitor        guard threshold, decision policy
@@ -51,6 +55,8 @@ from laya_guard import (  # noqa: E402
     rule_decision,
 )
 from tools import abuse_demo  # noqa: E402
+from console import router as console_router, runtime, store  # noqa: E402
+from agent import AgentMonitor  # noqa: E402
 
 
 def _env(name: str, default: str) -> str:
@@ -89,6 +95,11 @@ abuse = AbuseDetector(AbuseConfig(model=ABUSE_MODEL, threshold=ABUSE_THRESHOLD,
                                   mode=ABUSE_MODE, cooldown_s=ABUSE_COOLDOWN))
 abuse_log = DecisionLog(ABUSE_LOG)
 
+# console settings (SQLite) override the env defaults above
+runtime.bind(guard, abuse)
+runtime.load()
+runtime.agent = AgentMonitor(guard, abuse, runtime, store)
+
 _fast_guard = None
 _fast_guard_lock = threading.Lock()
 
@@ -105,7 +116,7 @@ def get_fast_guard():
 
 
 def upstream_key():
-    return os.environ.get(UPSTREAM_KEY_ENV, "")
+    return runtime.upstream_key
 
 
 def _compact_verdict(verdict):
@@ -132,12 +143,27 @@ def _warm_all():
         print("[guard] fast path unavailable: %r" % exc, flush=True)
 
 
+def _apply_device_rules():
+    # persistent blacklist from the console: keep these clients blocked
+    now = time.time()
+    for rule in store.list_rules():
+        expires = rule.get("expires_at") or 0
+        if expires and expires <= now:
+            continue
+        ttl = max(60, int(expires - now)) if expires else 30 * 86400
+        abuse.block_client(rule["device"], ttl, category="device_rule", score=1.0)
+
+
 async def _enforcement_loop():
     # every few seconds: evaluate triggered clients and block the abusive ones
     # for ABUSE_BLOCK_TTL. the detector itself only observes
     while True:
         await asyncio.sleep(ABUSE_ENFORCE_INTERVAL)
-        if not ABUSE_ENFORCE:
+        try:
+            _apply_device_rules()
+        except Exception as exc:
+            print("[guard] device rule sync error: %r" % exc, flush=True)
+        if not runtime.abuse_enforce:
             continue
         try:
             verdicts = await run_in_threadpool(abuse.evaluate_triggered, "block")
@@ -146,29 +172,63 @@ async def _enforcement_loop():
             continue
         for verdict in verdicts:
             abuse_log.append(verdict, meta={"endpoint": "demo-api/enforce", "client": verdict.client})
+            store.log_abuse(verdict.to_dict(), {"endpoint": "demo-api/enforce"})
             if verdict.enforced:
-                abuse.block_client(verdict.client, ABUSE_BLOCK_TTL,
+                abuse.block_client(verdict.client, runtime.abuse_block_ttl,
                                    category=verdict.category, score=verdict.abuse_score)
+                store.log_block(verdict.client, "block", verdict.category, verdict.abuse_score,
+                                until=time.time() + runtime.abuse_block_ttl)
                 print("[guard] blocked %s for %.0fs, %s (%.3f)"
-                      % (verdict.client, ABUSE_BLOCK_TTL, verdict.category, verdict.abuse_score), flush=True)
+                      % (verdict.client, runtime.abuse_block_ttl, verdict.category, verdict.abuse_score), flush=True)
+
+
+async def _agent_loop():
+    # 24/7 monitor: snapshot the guard every agent_interval seconds and act on
+    # anything that slipped through the automatic enforcement
+    while True:
+        await asyncio.sleep(max(5, runtime.agent_interval))
+        if not runtime.agent_enabled or runtime.agent is None:
+            continue
+        try:
+            await run_in_threadpool(runtime.agent.run_once)
+        except Exception as exc:
+            print("[guard] agent monitor error: %r" % exc, flush=True)
+
+
+async def _retention_loop():
+    # keep the console database inside the configured retention window
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            store.purge(runtime.retention_days)
+        except Exception as exc:
+            print("[guard] retention purge failed: %r" % exc, flush=True)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    store.purge(runtime.retention_days)
+    _apply_device_rules()
     threading.Thread(target=_warm_all, daemon=True).start()
     task = asyncio.create_task(_enforcement_loop())
+    retention = asyncio.create_task(_retention_loop())
+    agent_task = asyncio.create_task(_agent_loop())
     try:
         yield
     finally:
         task.cancel()
+        retention.cancel()
+        agent_task.cancel()
+        retention.cancel()
 
 
-app = FastAPI(title="Laya Guard", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Aegis", version="0.2.0", lifespan=lifespan)
+app.include_router(console_router)
 
 
 @app.get("/")
 def index():
-    return RedirectResponse(url="/chat", status_code=307)
+    return RedirectResponse(url="/console", status_code=307)
 
 
 @app.get("/chat")
@@ -198,24 +258,41 @@ def health():
     return {
         "status": "ok",
         "key_env": UPSTREAM_KEY_ENV,
-        "key_set": bool(upstream_key()),
-        "upstream": UPSTREAM_BASE,
-        "upstream_model": UPSTREAM_MODEL,
-        "mode": MODE,
-        "threshold": THRESHOLD,
+        "key_set": bool(runtime.upstream_key),
+        "key_source": runtime.key_source(),
+        "upstream": runtime.upstream_base,
+        "upstream_model": runtime.upstream_model,
+        "mode": runtime.guard_mode,
+        "threshold": guard.cfg.threshold,
         "model": GUARD_MODEL,
         "loaded": guard.loaded_models,
         "device": "cuda" if _cuda() else "cpu",
         "abuse": {
-            "mode": ABUSE_MODE,
-            "threshold": ABUSE_THRESHOLD,
+            "mode": runtime.abuse_mode,
+            "threshold": runtime.abuse_threshold,
             "model": ABUSE_MODEL,
             "cooldown_s": ABUSE_COOLDOWN,
-            "enforce": ABUSE_ENFORCE,
-            "block_ttl_s": ABUSE_BLOCK_TTL,
+            "enforce": runtime.abuse_enforce,
+            "block_ttl_s": runtime.abuse_block_ttl,
             "enforce_interval_s": ABUSE_ENFORCE_INTERVAL,
         },
         "blocked_clients": abuse.blocked_clients(),
+        "agent": {
+            "enabled": runtime.agent_enabled,
+            "mode": runtime.agent_mode,
+            "interval_s": runtime.agent_interval,
+            "llm": runtime.agent_llm,
+            "runs": runtime.agent.runs if runtime.agent else 0,
+            "actions": runtime.agent.actions_taken if runtime.agent else 0,
+            "last_run_age_s": (round(time.time() - runtime.agent.last_run, 1)
+                               if runtime.agent and runtime.agent.last_run else None),
+            "last_error": runtime.agent.last_error if runtime.agent else "",
+        },
+        "console": {
+            "configured": store.admin_configured(),
+            "retention_days": runtime.retention_days,
+            "db": str(store.path),
+        },
         "fastpath": {
             "enabled": GUARD_FASTPATH,
             "artifact": FastGuard.available(),
@@ -243,7 +320,7 @@ def decisions(limit: int = 60):
 
 def _request_mode(request):
     header = (request.headers.get("x-guard-mode") or "").lower()
-    return header if header in ("block", "monitor") else MODE
+    return header if header in ("block", "monitor") else guard.cfg.mode
 
 
 @app.post("/v1/guard/check")
@@ -256,6 +333,7 @@ async def guard_check(request: Request):
     mode = _request_mode(request)
     verdict = await run_in_threadpool(guard.check_request, payload, mode=mode)
     log.append(verdict, meta={"endpoint": "guard/check"})
+    store.log_guard(verdict.to_dict(), {"endpoint": "guard/check"})
     return verdict.to_dict()
 
 
@@ -300,10 +378,11 @@ async def chat_completions(request: Request):
             )
             log.append(fast_verdict, meta={"endpoint": "chat/completions", "fastpath": True,
                                            "model": fast_result.model})
+            store.log_guard(fast_verdict.to_dict(), {"endpoint": "chat/completions", "fastpath": True})
             return JSONResponse(
                 status_code=403,
                 content={
-                    "error": {"message": "blocked by Laya Guard (fast path): prompt injection",
+                    "error": {"message": "blocked by Aegis Guard (fast path): prompt injection",
                               "type": "prompt_injection_blocked", "code": "guard_blocked"},
                     "guard": fast_verdict.to_dict(),
                 },
@@ -311,14 +390,15 @@ async def chat_completions(request: Request):
             )
 
     verdict = await run_in_threadpool(guard.check_messages, messages, mode=mode)
-    log.append(verdict, meta={"endpoint": "chat/completions", "model": payload.get("model") or UPSTREAM_MODEL})
+    log.append(verdict, meta={"endpoint": "chat/completions", "model": payload.get("model") or runtime.upstream_model})
+    store.log_guard(verdict.to_dict(), {"endpoint": "chat/completions"})
 
     if verdict.enforced:
         return JSONResponse(
             status_code=403,
             content={
                 "error": {
-                    "message": "blocked by Laya Guard: prompt injection",
+                    "message": "blocked by Aegis Guard: prompt injection",
                     "type": "prompt_injection_blocked",
                     "code": "guard_blocked",
                 },
@@ -340,14 +420,14 @@ async def chat_completions(request: Request):
         )
 
     forward = dict(payload)
-    forward["model"] = forward.get("model") or UPSTREAM_MODEL
+    forward["model"] = forward.get("model") or runtime.upstream_model
     forward.pop("guard_mode", None)
 
     started = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=15.0)) as client:
             upstream = await client.post(
-                UPSTREAM_BASE + "/chat/completions",
+                runtime.upstream_base + "/chat/completions",
                 json=forward,
                 headers={"Authorization": "Bearer %s" % key},
             )
@@ -372,7 +452,7 @@ async def chat_completions(request: Request):
 
 def _abuse_mode(request):
     header = (request.headers.get("x-abuse-mode") or "").lower()
-    return header if header in ("block", "monitor") else ABUSE_MODE
+    return header if header in ("block", "monitor") else abuse.cfg.mode
 
 
 def _events_from_body(body):
@@ -403,6 +483,12 @@ async def abuse_events(request: Request):
     verdicts = await run_in_threadpool(abuse.evaluate_triggered, mode)
     for verdict in verdicts:
         abuse_log.append(verdict, meta={"endpoint": "abuse/events", "client": verdict.client})
+        store.log_abuse(verdict.to_dict(), {"endpoint": "abuse/events"})
+        if verdict.enforced:
+            abuse.block_client(verdict.client, runtime.abuse_block_ttl,
+                               category=verdict.category, score=verdict.abuse_score)
+            store.log_block(verdict.client, "block", verdict.category, verdict.abuse_score,
+                            until=time.time() + runtime.abuse_block_ttl)
     return {"accepted": accepted, "evaluations": [v.to_dict() for v in verdicts]}
 
 
@@ -428,6 +514,7 @@ async def abuse_check(request: Request):
         if verdict is None:
             return JSONResponse(status_code=404, content={"error": {"message": "no traffic for client %r" % key}})
         abuse_log.append(verdict, meta={"endpoint": "abuse/check", "client": key})
+        store.log_abuse(verdict.to_dict(), {"endpoint": "abuse/check"})
         return {"verdicts": [verdict.to_dict()]}
 
     try:
@@ -437,6 +524,7 @@ async def abuse_check(request: Request):
     verdicts = await run_in_threadpool(abuse.check_events, events, mode)
     for verdict in verdicts:
         abuse_log.append(verdict, meta={"endpoint": "abuse/check", "client": verdict.client})
+        store.log_abuse(verdict.to_dict(), {"endpoint": "abuse/check"})
     return {"verdicts": [v.to_dict() for v in verdicts]}
 
 
@@ -503,13 +591,13 @@ async def demo_api_middleware(request: Request, call_next):
         except Exception:
             pass
 
-    if ABUSE_ENFORCE:
+    if runtime.abuse_enforce:
         block = abuse.block_state(client)
         if block:
             record(429, 0)
             _demo_decr_inflight(client)
             return JSONResponse(status_code=429, content={
-                "detail": "blocked by Laya Guard: %s (retry in %ss)"
+                "detail": "blocked by Aegis Guard: %s (retry in %ss)"
                           % (block.get("category") or "abuse", int(block["remaining_s"])),
                 "guard": {"client": client, **block},
             })
@@ -534,7 +622,7 @@ async def demo_api_middleware(request: Request, call_next):
 @app.get("/demo-api/")
 def demo_index():
     return {
-        "service": "demo API, the stand-in for the customer API behind Laya Guard",
+        "service": "demo API, the stand-in for the customer API behind Aegis Guard",
         "endpoints": [
             "GET  /demo-api/v1/products",
             "GET  /demo-api/v1/products/{id}   (1-500)",
@@ -547,7 +635,7 @@ def demo_index():
             "GET  /demo-api/v1/users/{id}      (1-4900)",
             "POST /demo-api/v1/auth/login      (username ending 00 + password 'correct')",
         ],
-        "notes": "every request is recorded as telemetry; Laya Guard blocks abusive clients with 429",
+        "notes": "every request is recorded as telemetry; Aegis Guard blocks abusive clients with 429",
     }
 
 
@@ -728,7 +816,7 @@ async def _execute_plan(plan):
                     response = await client.request(method, target + path, headers=headers, json=body)
                     status = response.status_code
                     size = len(response.content)
-                    if status == 429 and "Laya Guard" in response.text[:400]:
+                    if status == 429 and "Aegis Guard" in response.text[:400]:
                         guard_blocked = True
                 except httpx.HTTPError:
                     errors += 1
@@ -904,6 +992,7 @@ async def api_abuse_simulate(request: Request):
     elapsed = (time.perf_counter() - started) * 1000.0
     for verdict in verdicts:
         abuse_log.append(verdict, meta={"endpoint": "api-abuse/simulate", "profile": profile_id})
+        store.log_abuse(verdict.to_dict(), {"endpoint": "api-abuse/simulate"})
 
     return {
         "profile": profile_id,
@@ -950,6 +1039,7 @@ async def api_abuse_live(request: Request):
     verdicts = await run_in_threadpool(abuse.check_events, result["events"], mode)
     for verdict in verdicts:
         abuse_log.append(verdict, meta={"endpoint": "api-abuse/live", "profile": profile_id})
+        store.log_abuse(verdict.to_dict(), {"endpoint": "api-abuse/live"})
 
     return {
         "profile": profile_id,
@@ -973,21 +1063,26 @@ async def api_abuse_unblock(request: Request):
     client = body.get("client")
     if not client:
         return JSONResponse(status_code=422, content={"error": {"message": "client is required"}})
-    return {"client": str(client), "unblocked": abuse.clear_block(str(client))}
+    cleared = abuse.clear_block(str(client))
+    if cleared:
+        store.log_block(str(client), "unblock")
+    return {"client": str(client), "unblocked": cleared}
 
 
 def main():
     import argparse
 
-    ap = argparse.ArgumentParser(description="Laya Guard server")
+    ap = argparse.ArgumentParser(description="Aegis Guard server")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8978)
     args = ap.parse_args()
 
-    print("[guard] upstream %s (%s)" % (UPSTREAM_BASE, UPSTREAM_MODEL), flush=True)
-    print("[guard] mode %s | threshold %s | model %s" % (MODE, THRESHOLD, GUARD_MODEL), flush=True)
-    print("[guard] key env %s (%s)" % (UPSTREAM_KEY_ENV, "set" if upstream_key() else "MISSING"), flush=True)
-    print("[guard] log %s" % LOG_PATH, flush=True)
+    print("[aegis] console  http://%s:%d/console" % (args.host, args.port), flush=True)
+    print("[aegis] upstream %s (%s), key %s"
+          % (runtime.upstream_base, runtime.upstream_model, runtime.key_source()), flush=True)
+    print("[aegis] guard %s | abuse %s%s"
+          % (runtime.guard_mode, runtime.abuse_mode, " +enforce" if runtime.abuse_enforce else ""), flush=True)
+    print("[aegis] db %s" % store.path, flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     return 0
 
