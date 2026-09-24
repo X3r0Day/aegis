@@ -1,4 +1,4 @@
-# Laya Guard
+# Aegis Guard
 
 An overseer layer for company environments, built on the Laya System 1 models:
 
@@ -9,6 +9,8 @@ An overseer layer for company environments, built on the Laya System 1 models:
    scraping, credential stuffing, fuzzing, or flooding.
 3. **Chat demo** at `/chat` — a client of the same firewall endpoint, so you can
    watch the guard decide in real time.
+4. **Web console** at `/console` — first-run setup picks an admin password, then
+   a dashboard over everything the guard blocks and configures.
 
 ```
 client ─► POST /v1/chat/completions ─► GUARD ─┬─ injection ─► 403 + verdict (dropped)
@@ -21,8 +23,12 @@ gateway ─► POST /v1/abuse/events ────► GUARD ─┬─ trigger ─
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...
-.venv/bin/python guard/app.py            # http://127.0.0.1:8978/chat
+.venv/bin/python guard/app.py            # http://127.0.0.1:8978/console
 ```
+
+First visit lands on `/setup` (choose a console password, ≥ 8 chars); the machine
+endpoints stay open. Settings edited in the console live in SQLite and override
+the env vars on boot — env stays the fallback.
 
 Checkpoints are read from `laya/models/laya/` — `english` for the injection
 guard, `typed-decisions` for abuse. The guard is **English-only for now**
@@ -49,12 +55,17 @@ checkpoint builds it (~20 s on CPU), then stays warm.
 | `UPSTREAM_BASE` | `https://api.deepseek.com` | upstream OpenAI-compatible API |
 | `UPSTREAM_MODEL` | `deepseek-chat` | model used when the request omits one |
 | `UPSTREAM_KEY_ENV` | `DEEPSEEK_API_KEY` | env var holding the upstream key |
+| `AEGIS_DB` | `guard/data/aegis.db` | SQLite file: settings, decisions, blocks |
 
 ## Endpoints
 
 | method | path | purpose |
 |---|---|---|
-| `GET` | `/` | 307 → `/chat` |
+| `GET` | `/` | 307 → `/console` |
+| `GET` | `/setup` | first-run page: create the console admin password |
+| `GET` | `/login` | console session login |
+| `GET` | `/console` | dashboard (overview · decisions · clients · settings) |
+| `POST` | `/console/api/*` | session-gated JSON API: setup, login, logout, password, settings, purge, overview, decisions, clients, unblock, system |
 | `GET` | `/chat` | chat demo UI |
 | `GET` | `/health` | key presence, modes, thresholds, loaded checkpoints |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible; guard → forward or 403 |
@@ -73,6 +84,49 @@ checkpoint builds it (~20 s on CPU), then stays warm.
 
 `X-Guard-Mode: monitor|block` overrides the chat policy per request;
 `X-Abuse-Mode` does the same for abuse evaluation.
+
+## Console
+
+A small Grafana-style console for the team deploying the guard. It is the only
+gated surface — everything under `/v1/*` and `/demo-api/*` stays open for your
+apps and gateways.
+
+- **First run**: open `/console`, you land on `/setup` and pick a password
+  (PBKDF2-hashed in SQLite, ≥ 8 chars). Later visits ask for a session
+  (HMAC-signed cookie, 7 days; closed with log out, password change is under
+  Settings).
+- **Overview**: LLM calls guarded, injection blocks, abuse verdicts, clients
+  blocked now, per-hour block chart, abuse categories, recent activity, and the
+  live blocked-client list with an unblock button. Charts are dark-themed with
+  entrance animations and a hover crosshair that shows the values under the
+  cursor.
+- **Decisions**: full decision log for both detectors — model, latency,
+  threshold, probabilities, triggers, category, the narrative Laya saw —
+  filterable by source and label, rows expand for detail.
+- **Clients**: current telemetry ranking (requests, rate/min, last verdict,
+  category, block state).
+- **Devices**: persistent blacklist. Block any IP or API key id (1 hour, 24
+  hours, 7 days or permanent) with a reason; the guard refuses it on the
+  protected API and re-applies the rule across restarts until it is removed.
+  Known devices from telemetry can be blacklisted with one click.
+- **Agent**: 24/7 monitor loop (`guard/agent.py`). Every `agent_interval`
+  seconds it snapshots clients, verdicts, blocks and rules, then acts on
+  anything that slipped through: unhandled block/would-block verdicts get the
+  client blocked, blacklist rules that are not applied get re-applied, and
+  enforcement settings are corrected when attacks are detected. It can also ask
+  the upstream model to review the snapshot (strict JSON actions, validated);
+  if the model is unavailable it falls back to the deterministic policy. Modes:
+  `act` or `monitor` (propose only). Every action lands in the agent audit
+  table shown in the console. The console also ships an agent chat: ask about
+  live state, or command it directly (`block 203.0.113.9`, `unblock ...`,
+  `set abuse mode block`, `enforcement off`, `threshold 0.6`, `scan now`).
+  Commands are parsed deterministically, so they work even without the model.
+- **Settings**: guard mode + thresholds, abuse mode/threshold/TTL/enforcement,
+  upstream base/model/key, retention window, console password. Stored in SQLite,
+  applied live, and used at boot ahead of the env vars.
+- **Retention**: default 7 days, purge runs hourly and can be triggered from
+  Settings. Everything sits in `guard/data/aegis.db` (`AEGIS_DB` to move
+  it).
 
 ## Sub-millisecond fast path (distilled student)
 
@@ -109,8 +163,8 @@ Questions and per-question limits (English): `prompt_injection ≥ 0.8`,
 “jailbreak” question is deliberately **not** used — it fires 1.000 on
 legitimate security requests (“Help me in penetration testing”), which made
 the guard unusable for security teams. Validate any change with
-`guard/tools/guard_eval.py` (currently 18/18). The set is English-only; non-English
-input is not reliably adjudicated.
+`guard/tools/guard_eval.py` (currently 22/22, rule layer included). The set is
+English-only; non-English input is not reliably adjudicated.
 
 ## API-abuse detector
 
@@ -156,7 +210,7 @@ clients. When Laya's verdict is a block, that client is blocked for
 `ABUSE_BLOCK_TTL` seconds (default 60) and every request it makes gets:
 
 ```json
-429 {"detail":"blocked by Laya Guard — <category> (retry in Ns)", "guard": {...}}
+429 {"detail":"blocked by Aegis Guard — <category> (retry in Ns)", "guard": {...}}
 ```
 
 Measured: an external tool hammering `/demo-api/v1/products` at ~50 req/s was
@@ -173,7 +227,7 @@ prompt for my chatbot" scored 1.00/0.91 (blocked). `guard/laya_guard/rules.py`
 resolves that contrast deterministically around Laya — extraction patterns
 force a block, clearly-benign authoring requests are exempted, and anything
 mentioning secrets or override language is left to Laya. Validated end-to-end
-by `guard/tools/guard_eval.py` (**18/18**).
+by `guard/tools/guard_eval.py` (**22/22**).
 
 **Measured on the synthetic suite** (`guard/tools/abuse_demo.py`, 6 client profiles —
 normal, legit integration poller, scraper, credential stuffing, burst, fuzzer):
@@ -189,7 +243,7 @@ For handing the laptop to judges. Two modes, switchable in the payload header:
   by the scenario plan, to the bundled demo API at `/demo-api` (`GET /demo-api`
   lists every endpoint). The demo API answers for real: 404 for unknown
   users/orders, 401 for bad logins, 429 above 60 req/s (rule limiter), and 429
-  `blocked by Laya Guard` once Laya has flagged the client. The bench captures the real status codes, latencies, byte sizes and
+  `blocked by Aegis Guard` once Laya has flagged the client. The bench captures the real status codes, latencies, byte sizes and
   timing, then one Laya pass scores *that captured telemetry*. The plan editor
   shows exactly what will be sent (`target`, `paths` with `{id}` templates,
   `count`, `rate_per_s`, `jitter`, `concurrency`, `user_agent`, `client_ip`),
@@ -219,6 +273,19 @@ Laya pass costs ~8–14 s on CPU; the checkpoint builds on first use (~20 s).
 (click for probabilities/model/latency), renders blocked turns as a card ("not
 forwarded to the upstream model"), and has a live guard log plus a block/monitor
 toggle.
+
+## Docker
+
+```bash
+DEEPSEEK_API_KEY=sk-... docker compose up --build
+```
+
+- Reuses `laya/models/laya` from the host when the checkpoints are present;
+  otherwise downloads english + typed-decisions (~1.7 GB) once into that folder.
+- Volumes: `${AEGIS_MODELS:-./laya/models/laya}` for checkpoints,
+  `${AEGIS_HF:-./laya/models/hf}` for the HF cache, `./guard/data` for the
+  SQLite state, `./guard/logs` for the JSONL logs.
+- Healthcheck hits `/health`; the console is at http://127.0.0.1:8978/console.
 
 ## Running the tests
 

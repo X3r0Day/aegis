@@ -9,6 +9,8 @@ laya/models/
 
 # runtime artifacts
 guard/logs/
+guard/data/
+docs/preview/
 *.log
 *.pid
 
@@ -18,3 +20,6 @@ guard/logs/
 # screenshots
 *.png
 !laya/webapp/playground.png
+
+# keep the generated accuracy chart
+!docs/aegis-accuracy.png
