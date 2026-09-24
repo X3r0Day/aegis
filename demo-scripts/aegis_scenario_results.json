@@ -1,0 +1,128 @@
+{
+  "generated_at": "2026-09-24 10:41:50",
+  "base": "http://127.0.0.1:8978",
+  "scenarios": [
+    {
+      "name": "normal browsing",
+      "kind": "benign",
+      "client": "198.51.100.11",
+      "planned": 60,
+      "rate_per_s": 6,
+      "allowed": 60,
+      "served": 60,
+      "blocked_by_aegis": 0,
+      "rate_limited": 0,
+      "failed": 0,
+      "wall_s": 10.01,
+      "outcome": "completed, allowed",
+      "cutoff": null
+    },
+    {
+      "name": "integration poller",
+      "kind": "benign",
+      "client": "198.51.100.12",
+      "planned": 80,
+      "rate_per_s": 4,
+      "allowed": 80,
+      "served": 80,
+      "blocked_by_aegis": 0,
+      "rate_limited": 0,
+      "failed": 0,
+      "wall_s": 20.02,
+      "outcome": "completed, allowed",
+      "cutoff": null
+    },
+    {
+      "name": "scraper",
+      "kind": "attack",
+      "client": "198.51.100.13",
+      "planned": 900,
+      "rate_per_s": 45,
+      "allowed": 576,
+      "served": 576,
+      "blocked_by_aegis": 324,
+      "rate_limited": 0,
+      "failed": 0,
+      "wall_s": 20.02,
+      "outcome": "stopped in flight",
+      "cutoff": {
+        "last_ok_idx": 575,
+        "last_ok_at_s": 12.78,
+        "first_block_idx": 576,
+        "first_block_at_s": 12.81,
+        "block_detail": "{\"detail\":\"blocked by Aegis Guard: scraping_enumeration (retry in 60s)\",\"guard\":{\"client\":\"198.51.100.13\",\"category\":\"scraping_enumeration\",\"score\":0.4936,\"rema"
+      }
+    },
+    {
+      "name": "credential stuffing",
+      "kind": "attack",
+      "client": "198.51.100.14",
+      "planned": 800,
+      "rate_per_s": 40,
+      "allowed": 404,
+      "served": 0,
+      "blocked_by_aegis": 396,
+      "rate_limited": 0,
+      "failed": 0,
+      "wall_s": 20.02,
+      "outcome": "stopped in flight",
+      "cutoff": {
+        "last_ok_idx": 403,
+        "last_ok_at_s": 10.08,
+        "first_block_idx": 404,
+        "first_block_at_s": 10.12,
+        "block_detail": "{\"detail\":\"blocked by Aegis Guard: credential_stuffing (retry in 60s)\",\"guard\":{\"client\":\"198.51.100.14\",\"category\":\"credential_stuffing\",\"score\":0.5075,\"remain"
+      }
+    },
+    {
+      "name": "burst",
+      "kind": "attack",
+      "client": "198.51.100.15",
+      "planned": 700,
+      "rate_per_s": 52,
+      "allowed": 650,
+      "served": 650,
+      "blocked_by_aegis": 50,
+      "rate_limited": 0,
+      "failed": 0,
+      "wall_s": 14.01,
+      "outcome": "stopped in flight",
+      "cutoff": {
+        "last_ok_idx": 649,
+        "last_ok_at_s": 12.48,
+        "first_block_idx": 650,
+        "first_block_at_s": 12.52,
+        "block_detail": "{\"detail\":\"blocked by Aegis Guard: integration_burst (retry in 60s)\",\"guard\":{\"client\":\"198.51.100.15\",\"category\":\"integration_burst\",\"score\":0.6011,\"remaining_"
+      }
+    },
+    {
+      "name": "fuzzer",
+      "kind": "attack",
+      "client": "198.51.100.16",
+      "planned": 600,
+      "rate_per_s": 40,
+      "allowed": 52,
+      "served": 0,
+      "blocked_by_aegis": 548,
+      "rate_limited": 0,
+      "failed": 0,
+      "wall_s": 15.03,
+      "outcome": "stopped in flight",
+      "cutoff": {
+        "last_ok_idx": 51,
+        "last_ok_at_s": 1.28,
+        "first_block_idx": 52,
+        "first_block_at_s": 1.3,
+        "block_detail": "{\"detail\":\"blocked by Aegis Guard: agent (retry in 3600s)\",\"guard\":{\"client\":\"198.51.100.16\",\"category\":\"agent\",\"score\":1.0,\"remaining_s\":3600.0}}"
+      }
+    }
+  ],
+  "injection": {
+    "attacks": 8,
+    "attacks_blocked": 8,
+    "attacks_missed": [],
+    "benign": 8,
+    "benign_allowed": 8,
+    "benign_flagged": []
+  }
+}
