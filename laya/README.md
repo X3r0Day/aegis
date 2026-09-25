@@ -74,7 +74,7 @@ An interactive UI for testing custom states, scenarios and questions:
 ![Laya Playground](webapp/playground.png)
 
 - **State panel** — edit the state as JSON (or plain text) with scenario presets:
-  prompt-injection guardrails, insider-threat alert (SIH PS-8), phishing email,
+  prompt-injection guardrails, insider-threat alert (Binary Hacks PS-8), phishing email,
   support-ticket triage, content moderation, LLM routing, blank.
 - **Questions panel** — visual builder for `choice` / `score` / `noul` questions:
   add/remove questions, edit option keys/descriptions and ordered score levels; an
@@ -155,7 +155,7 @@ The English checkpoint **collapses on non-Latin scripts while staying confident*
 anything outside English (e.g. Hindi logs) use `multilingual` or `Router`, which detects the
 script before the forward pass.
 
-## Notes for the SIH PS-8 platform (insider threat / autonomous defense)
+## Notes for the Binary Hacks PS-8 platform (insider threat / autonomous defense)
 
 - **Prompt Injection & API Abuse Detector** → `guard_questions()` + `Router`: a single pass
   over input text yields P(jailbreak), P(prompt_injection), P(sensitive_data) + harm severity

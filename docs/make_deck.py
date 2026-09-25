@@ -121,7 +121,7 @@ text(s, 6.3665, 1.78, 0.6, 0.6,
      [{"parts": [{"t": "A", "color": BG, "bold": True, "size": 22}]}],
      align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
 text(s, 1.5, 2.62, 10.333, 0.3,
-     [{"parts": [{"t": "SMART INDIA HACKATHON · PROBLEM STATEMENT 8", "color": FAINT,
+     [{"parts": [{"t": "BINARY HACKS · PROBLEM STATEMENT 8", "color": FAINT,
                  "size": 11.5, "bold": True}]}],
      align=PP_ALIGN.CENTER)
 text(s, 1.5, 2.92, 10.333, 1.0,

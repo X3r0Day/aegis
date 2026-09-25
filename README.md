@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.12-blue?logo=python&logoColor=white)](https://www.python.org/)
 [![docker](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](https://docs.docker.com/)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![problem](https://img.shields.io/badge/SIH-problem%20statement%208-orange)]()
+[![problem](https://img.shields.io/badge/Binary%20Hacks-PS%208-orange)]()
 [![guard eval](https://img.shields.io/badge/guard%20eval-22%2F22-brightgreen)]()
 [![scenarios](https://img.shields.io/badge/attack%20runs-0%20of%204%20succeeded-brightgreen)]()
 

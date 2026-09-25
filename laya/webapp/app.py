@@ -178,7 +178,7 @@ def presets():
             },
             {
                 "id": "insider_alert",
-                "name": "Insider-threat alert (SIH PS-8)",
+                "name": "Insider-threat alert (Binary Hacks PS-8)",
                 "description": "SIEM alert: bulk payroll download to personal mail after resignation.",
                 "state": scenarios.TRIAGE_ALERT,
                 "questions": scenarios.TRIAGE_QUESTIONS,
