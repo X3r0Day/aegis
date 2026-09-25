@@ -286,6 +286,13 @@ over environment variables at startup.
 More detail on endpoints, the telemetry schema and the fast path lives in
 `guard/README.md`.
 
+## Team
+
+Built by:
+
+- [X3r0Day](https://github.com/X3r0Day)
+- [vishesh07-codes](https://github.com/vishesh07-codes)
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
