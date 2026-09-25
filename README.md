@@ -15,6 +15,26 @@ the live state and acts.
 
 Everything runs on one machine. Data goes in, nothing goes out.
 
+## What is different here
+
+Small guard models are not new. Meta ships Llama Prompt Guard for prompt
+injection, and there are classifier based firewalls for LLM traffic. What we
+could not find anywhere else, as of September 2026, is this exact combination:
+
+- An end-to-end guard whose decision layer is a System 1 decision model (Laya)
+  for both prompt injection and API abuse, with per question confidences and
+  thresholds instead of one unsafe score.
+- An agent that does more than classify. It runs 24/7, blocks clients and
+  corrects settings on its own, and every action lands in an audit trail. The
+  classifier projects we looked at only report.
+- The whole thing self hosted in one process: console, dashboard, persistent
+  device blacklist, and a distilled student that answers inline in
+  microseconds, with no cloud call per decision.
+
+To be exact about the claim: the concept of a small model for security
+decisions has prior art, and Laya has been evaluated for agent security before.
+Our claim is the end-to-end product shape, not the idea.
+
 ## Why
 
 Rate limits and signatures miss the attacks that matter:
