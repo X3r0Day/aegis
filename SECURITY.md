@@ -2,10 +2,13 @@
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for security problems. Use GitHub private
-reporting instead:
+Please do not open a public issue for security problems.
 
-https://github.com/X3r0Day/aegis/security/advisories/new
+GitHub private reporting only works on public repositories, and this one is
+private, so the advisories page will not exist yet. Two ways to reach us:
+
+- If the repository is made public, use the Security tab, Report a vulnerability.
+- Otherwise contact the maintainer through https://github.com/X3r0Day and ask for a private channel.
 
 Include the version or commit, the exact request or input that triggers the
 issue, and what you expected to happen. If you need to attach traffic, strip
